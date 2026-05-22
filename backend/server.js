@@ -59,6 +59,11 @@ app.use(cors({
 app.use(express.json());
 app.use('/api', apiRateLimit);
 
+app.use('/api/auth', (req, res, next) => {
+  console.log('AUTH HIT:', req.method, req.originalUrl);
+  next();
+});
+
 console.log('AUTH ROUTES LOADED:', !!authRoutes);
 app.use('/api/auth', authRoutes);
 console.log('Auth routes mounted at /api/auth');

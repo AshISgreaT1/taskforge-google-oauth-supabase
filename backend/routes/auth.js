@@ -34,6 +34,10 @@ router.post(
     body('jobRole').not().exists().withMessage('Job role cannot be set during signup')
   ],
   validate,
+  (req, res, next) => {
+    console.log('AUTH ROUTE HIT /signup', req.method, req.originalUrl, req.body && { email: req.body.email });
+    next();
+  },
   signup
 );
 
@@ -44,6 +48,10 @@ router.post(
     body('password').notEmpty().withMessage('Password is required')
   ],
   validate,
+  (req, res, next) => {
+    console.log('AUTH ROUTE HIT /login', req.method, req.originalUrl, req.body && { email: req.body.email });
+    next();
+  },
   login
 );
 
