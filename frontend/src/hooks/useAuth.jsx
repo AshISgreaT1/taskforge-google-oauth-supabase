@@ -3,16 +3,25 @@ import { authAPI } from '../services/api';
 
 const AuthContext = createContext(null);
 
+const parseSavedUser = () => {
+  try {
+    return JSON.parse(localStorage.getItem('user') || 'null');
+  } catch {
+    localStorage.removeItem('user');
+    return null;
+  }
+};
+
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const token = localStorage.getItem('token');
-    const savedUser = localStorage.getItem('user');
+    const savedUser = parseSavedUser();
 
     if (token && savedUser) {
-      setUser(JSON.parse(savedUser));
+      setUser(savedUser);
       authAPI.getMe()
         .then(res => {
           setUser(res.data.user);
