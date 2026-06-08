@@ -1,6 +1,7 @@
 import axios from 'axios';
 
-const API_URL = `${import.meta.env.VITE_API_URL.replace(/\/$/, '')}/api`;
+const API_BASE = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '');
+const API_URL = `${API_BASE}/api`;
 
 const API = axios.create({
   baseURL: API_URL,
@@ -32,6 +33,7 @@ API.interceptors.response.use(
 );
 
 export const authAPI = {
+  googleLogin: (credential) => API.post('/auth/google', { credential }),
   signup: (data) => API.post('/auth/signup', data),
   login: (data) => API.post('/auth/login', data),
   getMe: () => API.get('/auth/me'),

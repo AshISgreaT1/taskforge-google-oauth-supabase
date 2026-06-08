@@ -17,7 +17,7 @@ import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../components/Layout';
 
 export default function Settings() {
-  const { user, updateUser } = useAuth();
+  const { user } = useAuth();
   const toast = useToast();
 
   const [activeTab, setActiveTab] = useState('profile');

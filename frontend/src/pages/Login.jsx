@@ -1,131 +1,168 @@
-import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Sparkles, Mail, Lock, Eye, EyeOff, Loader2 } from 'lucide-react';
+import { Sparkles, ShieldCheck, Loader2 } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
 
+const GOOGLE_SCRIPT_ID = 'google-identity-script';
+
+function loadGoogleScript() {
+  return new Promise((resolve, reject) => {
+    if (window.google?.accounts?.id) {
+      resolve(window.google);
+      return;
+    }
+
+    if (document.getElementById(GOOGLE_SCRIPT_ID)) {
+      const check = setInterval(() => {
+        if (window.google?.accounts?.id) {
+          clearInterval(check);
+          resolve(window.google);
+        }
+      }, 50);
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.id = GOOGLE_SCRIPT_ID;
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve(window.google);
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
 export default function Login() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
-  const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const { login } = useAuth();
+  const [error, setError] = useState('');
+  const buttonRef = useRef(null);
+  const { googleLogin } = useAuth();
   const navigate = useNavigate();
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
+  useEffect(() => {
+    let mounted = true;
 
-    try {
-      await login(email, password);
-      navigate('/dashboard');
-    } catch (err) {
-      setError(err.response?.data?.message || 'Login failed. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
+    const init = async () => {
+      try {
+        await loadGoogleScript();
+        if (!mounted || !window.google?.accounts?.id || !buttonRef.current) return;
+
+        window.google.accounts.id.initialize({
+          client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
+          callback: async (response) => {
+            try {
+              setLoading(true);
+              setError('');
+              await googleLogin(response.credential);
+              navigate('/dashboard');
+            } catch (err) {
+              setError(err.response?.data?.message || 'Google sign in failed. Please try again.');
+            } finally {
+              setLoading(false);
+            }
+          }
+        });
+
+        window.google.accounts.id.renderButton(buttonRef.current, {
+          theme: document.documentElement.classList.contains('dark') ? 'filled_black' : 'outline',
+          size: 'large',
+          text: 'signin_with',
+          shape: 'pill',
+          width: 320
+        });
+      } catch (err) {
+        setError('Google sign in could not be loaded.');
+      }
+    };
+
+    init();
+    return () => {
+      mounted = false;
+    };
+  }, [googleLogin, navigate]);
 
   return (
-    <div className="min-h-screen bg-dark-900 flex items-center justify-center p-4">
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-primary-600/10 rounded-full blur-3xl" />
-        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-primary-600/10 rounded-full blur-3xl" />
-      </div>
+    <div className="min-h-screen bg-slate-950 text-white relative overflow-hidden flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,_rgba(14,165,233,0.18),_transparent_30%),radial-gradient(circle_at_bottom_right,_rgba(34,197,94,0.14),_transparent_28%),linear-gradient(135deg,_#020617_0%,_#0f172a_100%)]" />
+      <div className="absolute inset-0 opacity-30 bg-[linear-gradient(rgba(255,255,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.04)_1px,transparent_1px)] bg-[size:48px_48px]" />
 
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5 }}
-        className="w-full max-w-md relative z-10"
+        className="relative z-10 w-full max-w-5xl grid lg:grid-cols-[1.15fr_0.85fr] gap-8 items-center"
       >
-        <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center p-3 bg-primary-600/20 rounded-2xl mb-4">
-            <Sparkles className="w-8 h-8 text-primary-500" />
+        <div className="space-y-6">
+          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/5 border border-white/10 text-sm text-slate-200">
+            <Sparkles className="w-4 h-4 text-cyan-400" />
+            Production-ready task ops for growing teams
           </div>
-          <h1 className="text-3xl font-bold">Welcome Back</h1>
-          <p className="text-dark-400 mt-2">Sign in to TaskForge</p>
+          <h1 className="text-4xl md:text-6xl font-black tracking-tight leading-[0.95]">
+            Task management that feels like a startup dashboard.
+          </h1>
+          <p className="text-lg text-slate-300 max-w-xl">
+            Sign in with Google to manage tasks, assignments, activity, and team performance from one clean workspace.
+          </p>
+
+          <div className="grid sm:grid-cols-3 gap-4 max-w-2xl">
+            {[
+              ['OAuth', 'Google Sign-In'],
+              ['DB', 'Supabase Postgres'],
+              ['Alerts', 'Gmail SMTP']
+            ].map(([k, v]) => (
+              <div key={k} className="rounded-2xl border border-white/10 bg-white/5 p-4 backdrop-blur">
+                <p className="text-xs uppercase tracking-[0.25em] text-slate-400">{k}</p>
+                <p className="mt-2 font-semibold">{v}</p>
+              </div>
+            ))}
+          </div>
         </div>
 
-        <div className="card">
-          <form onSubmit={handleSubmit} className="space-y-5">
+        <div className="relative">
+          <div className="absolute -inset-1 rounded-[2rem] bg-gradient-to-br from-cyan-500/20 via-emerald-500/10 to-transparent blur-2xl" />
+          <div className="relative rounded-[2rem] border border-white/10 bg-slate-900/85 backdrop-blur-xl shadow-2xl p-8">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="h-12 w-12 rounded-2xl bg-cyan-500/15 flex items-center justify-center">
+                <ShieldCheck className="w-6 h-6 text-cyan-300" />
+              </div>
+              <div>
+                <p className="text-sm text-slate-400">Welcome back</p>
+                <h2 className="text-2xl font-bold">Sign in to TaskForge</h2>
+              </div>
+            </div>
+
             {error && (
-              <motion.div
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="p-4 bg-red-600/20 border border-red-600/50 rounded-lg text-red-400 text-sm"
-              >
+              <div className="mb-4 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                 {error}
-              </motion.div>
+              </div>
             )}
 
-            <div>
-              <label className="block text-sm font-medium mb-2">Email</label>
-              <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-dark-400" />
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="input-field pl-11"
-                  placeholder="Enter your email"
-                  required
-                />
-              </div>
+            <div className="space-y-4">
+              <div ref={buttonRef} className="flex justify-center min-h-[44px]" />
+              <button
+                type="button"
+                onClick={() => window.google?.accounts?.id?.prompt()}
+                disabled={loading}
+                className="w-full rounded-full bg-white text-slate-950 font-semibold px-4 py-3 hover:bg-slate-100 transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              >
+                {loading && <Loader2 className="w-4 h-4 animate-spin" />}
+                Continue with Google
+              </button>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium mb-2">Password</label>
-              <div className="relative">
-                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-dark-400" />
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="input-field pl-11 pr-11"
-                  placeholder="Enter your password"
-                  required
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-dark-400 hover:text-white transition-colors"
-                >
-                  {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                </button>
-              </div>
-            </div>
+            <p className="mt-6 text-sm text-slate-400">
+              By continuing, you agree to the platform terms and team workspace access policies.
+            </p>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="btn-primary w-full flex items-center justify-center gap-2 py-3"
-            >
-              {loading ? (
-                <>
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  Signing in...
-                </>
-              ) : (
-                'Sign In'
-              )}
-            </button>
-          </form>
-
-          <p className="text-center mt-6 text-dark-400">
-            Don't have an account?{' '}
-            <Link to="/signup" className="text-primary-500 hover:text-primary-400 font-medium">
-              Sign up
-            </Link>
-          </p>
-        </div>
-
-        <div className="mt-6 p-4 bg-dark-800/50 rounded-lg border border-dark-700">
-          <p className="text-sm text-dark-400 text-center">
-            Demo: admin@taskforge.ai / password123
-          </p>
+            <p className="mt-8 text-sm text-slate-400">
+              New here?{' '}
+              <Link to="/signup" className="text-cyan-300 hover:text-cyan-200 font-medium">
+                Go to signup
+              </Link>
+            </p>
+          </div>
         </div>
       </motion.div>
     </div>
