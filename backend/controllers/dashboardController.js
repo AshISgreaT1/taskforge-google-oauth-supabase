@@ -1,63 +1,72 @@
-const Task = require('../models/Task');
-const Project = require('../models/Project');
-const User = require('../models/User');
+const { supabase } = require('../config/supabase');
+const { hydrateTasks, hydrateProjects, getProjectMembers, getUsersByIds } = require('../services/repository');
+
+async function getAccessibleProjectIds(user) {
+  if (user.role === 'admin') {
+    const { data, error } = await supabase.from('projects').select('id');
+    if (error) throw error;
+    return (data || []).map(project => project.id);
+  }
+
+  const [owned, memberships] = await Promise.all([
+    supabase.from('projects').select('id').eq('created_by', user.id),
+    supabase.from('project_members').select('project_id').eq('user_id', user.id)
+  ]);
+
+  if (owned.error) throw owned.error;
+  if (memberships.error) throw memberships.error;
+
+  return [
+    ...(owned.data || []).map(project => project.id),
+    ...(memberships.data || []).map(member => member.project_id)
+  ];
+}
 
 exports.getDashboard = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const projectIds = await getAccessibleProjectIds(req.user);
+    const [projectsRes, tasksRes, usersRes] = await Promise.all([
+      supabase.from('projects').select('*').in('id', projectIds.length ? projectIds : ['00000000-0000-0000-0000-000000000000']),
+      supabase.from('tasks').select('*').in('project_id', projectIds.length ? projectIds : ['00000000-0000-0000-0000-000000000000']),
+      supabase.from('users').select('*').eq('is_active', true)
+    ]);
 
-    const projectFilter = req.user.role === 'admin' ? {} : {
-      $or: [
-        { createdBy: userId },
-        { 'members.user': userId }
-      ]
-    };
+    if (projectsRes.error) throw projectsRes.error;
+    if (tasksRes.error) throw tasksRes.error;
+    if (usersRes.error) throw usersRes.error;
 
-    const userProjects = await Project.find(projectFilter);
-
-    const projectIds = userProjects.map(p => p._id);
-
-    const allTasks = await Task.find({
-      projectId: { $in: projectIds }
-    });
+    const userProjects = await hydrateProjects(projectsRes.data || []);
+    const allTasks = await hydrateTasks(tasksRes.data || []);
 
     const now = new Date();
-
     const totalTasks = allTasks.length;
     const completedTasks = allTasks.filter(t => t.status === 'completed').length;
     const pendingTasks = allTasks.filter(t => t.status === 'todo').length;
     const inProgressTasks = allTasks.filter(t => t.status === 'in-progress').length;
-    const overdueTasks = allTasks.filter(t =>
-      t.dueDate &&
-      new Date(t.dueDate) < now &&
-      t.status !== 'completed'
-    ).length;
+    const overdueTasks = allTasks.filter(t => t.dueDate && new Date(t.dueDate) < now && t.status !== 'completed').length;
 
     const userTaskStats = {};
     allTasks.forEach(task => {
-      if (task.assignedTo) {
-        const userIdStr = task.assignedTo.toString();
-        if (!userTaskStats[userIdStr]) {
-          userTaskStats[userIdStr] = { assigned: 0, completed: 0 };
+      if (task.assignedTo?._id) {
+        const id = task.assignedTo._id;
+        if (!userTaskStats[id]) {
+          userTaskStats[id] = { assigned: 0, completed: 0 };
         }
-        userTaskStats[userIdStr].assigned++;
-        if (task.status === 'completed') {
-          userTaskStats[userIdStr].completed++;
-        }
+        userTaskStats[id].assigned++;
+        if (task.status === 'completed') userTaskStats[id].completed++;
       }
     });
 
-    const leaderboard = await User.find().select('name avatar').lean();
-    const leaderboardWithStats = leaderboard.map(user => {
-      const stats = userTaskStats[user._id.toString()] || { assigned: 0, completed: 0 };
+    const leaderboard = (usersRes.data || []).map(user => {
+      const stats = userTaskStats[user.id] || { assigned: 0, completed: 0 };
       const productivityScore = stats.assigned > 0
         ? Math.round((stats.completed / stats.assigned) * 100)
         : 0;
       return {
         user: {
-          _id: user._id,
+          _id: user.id,
           name: user.name,
-          avatar: user.avatar
+          avatar: user.avatar_url
         },
         assignedTasks: stats.assigned,
         completedTasks: stats.completed,
@@ -79,14 +88,9 @@ exports.getDashboard = async (req, res) => {
       completed: completedTasks
     };
 
-    const recentActivity = await Task.find({
-      projectId: { $in: projectIds }
-    })
-    .sort({ updatedAt: -1 })
-    .limit(10)
-    .populate('assignedTo', 'name avatar')
-    .populate('projectId', 'title')
-    .select('title status updatedAt projectId');
+    const recentActivity = allTasks
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+      .slice(0, 10);
 
     res.json({
       success: true,
@@ -102,7 +106,7 @@ exports.getDashboard = async (req, res) => {
       },
       tasksByPriority,
       tasksByStatus,
-      leaderboard: leaderboardWithStats.slice(0, 10),
+      leaderboard: leaderboard.slice(0, 10),
       recentActivity,
       overallProductivity: totalTasks > 0
         ? Math.round((completedTasks / totalTasks) * 100)
@@ -129,35 +133,51 @@ exports.getTeamStats = async (req, res) => {
       });
     }
 
-    const project = await Project.findById(projectId)
-      .populate('members.user', 'name avatar email jobRole')
-      .populate('createdBy', 'name avatar email');
+    const { data: projectRow, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', projectId)
+      .maybeSingle();
 
-    if (!project) {
+    if (error) throw error;
+    if (!projectRow) {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
       });
     }
 
-    const tasks = await Task.find({ projectId });
-
-    const hasAccess = req.user.role === 'admin' ||
-      project.createdBy._id.toString() === req.user.id ||
-      project.members.some(member => (member.user?._id || member.user || member).toString() === req.user.id);
-
-    if (!hasAccess) {
+    const accessible = await getAccessibleProjectIds(req.user);
+    if (req.user.role !== 'admin' && !accessible.includes(projectId)) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to access this project'
       });
     }
 
-    const teamStats = project.members.map(projectMember => {
-      const member = projectMember.user || projectMember;
-      const memberTasks = tasks.filter(t =>
-        t.assignedTo && t.assignedTo.toString() === member._id.toString()
-      );
+    const [membersRes, tasksRes, creatorRes] = await Promise.all([
+      supabase.from('project_members').select('*').eq('project_id', projectId),
+      supabase.from('tasks').select('*').eq('project_id', projectId),
+      supabase.from('users').select('*').eq('id', projectRow.created_by).maybeSingle()
+    ]);
+
+    if (membersRes.error) throw membersRes.error;
+    if (tasksRes.error) throw tasksRes.error;
+    if (creatorRes.error) throw creatorRes.error;
+
+    const memberUserIds = (membersRes.data || []).map(member => member.user_id);
+    const usersRes = memberUserIds.length
+      ? await supabase.from('users').select('*').in('id', memberUserIds)
+      : { data: [] };
+
+    if (usersRes.error) throw usersRes.error;
+
+    const userMap = new Map((usersRes.data || []).map(user => [user.id, user]));
+    const tasks = await hydrateTasks(tasksRes.data || []);
+
+    const teamStats = (membersRes.data || []).map(member => {
+      const user = userMap.get(member.user_id);
+      const memberTasks = tasks.filter(t => t.assignedTo?._id === member.user_id);
       const completed = memberTasks.filter(t => t.status === 'completed').length;
       const productivity = memberTasks.length > 0
         ? Math.round((completed / memberTasks.length) * 100)
@@ -165,27 +185,21 @@ exports.getTeamStats = async (req, res) => {
 
       return {
         member: {
-          _id: member._id,
-          name: member.name,
-          avatar: member.avatar,
-          email: member.email
+          _id: member.user_id,
+          name: user?.name,
+          avatar: user?.avatar_url,
+          email: user?.email
         },
         totalAssigned: memberTasks.length,
         completed,
         inProgress: memberTasks.filter(t => t.status === 'in-progress').length,
         todo: memberTasks.filter(t => t.status === 'todo').length,
-        overdue: memberTasks.filter(t =>
-          t.dueDate &&
-          new Date(t.dueDate) < new Date() &&
-          t.status !== 'completed'
-        ).length,
+        overdue: memberTasks.filter(t => t.dueDate && new Date(t.dueDate) < new Date() && t.status !== 'completed').length,
         productivity
       };
     });
 
-    const ownerTasks = tasks.filter(t =>
-      t.createdBy && t.createdBy.toString() === project.createdBy._id.toString()
-    );
+    const ownerTasks = tasks.filter(t => t.createdBy?._id === projectRow.created_by);
     const ownerCompleted = ownerTasks.filter(t => t.status === 'completed').length;
     const ownerProductivity = ownerTasks.length > 0
       ? Math.round((ownerCompleted / ownerTasks.length) * 100)
@@ -193,20 +207,16 @@ exports.getTeamStats = async (req, res) => {
 
     teamStats.unshift({
       member: {
-        _id: project.createdBy._id,
-        name: project.createdBy.name,
-        avatar: project.createdBy.avatar,
-        email: project.createdBy.email
+        _id: creatorRes.data.id,
+        name: creatorRes.data.name,
+        avatar: creatorRes.data.avatar_url,
+        email: creatorRes.data.email
       },
       totalAssigned: ownerTasks.length,
       completed: ownerCompleted,
       inProgress: ownerTasks.filter(t => t.status === 'in-progress').length,
       todo: ownerTasks.filter(t => t.status === 'todo').length,
-      overdue: ownerTasks.filter(t =>
-        t.dueDate &&
-        new Date(t.dueDate) < new Date() &&
-        t.status !== 'completed'
-      ).length,
+      overdue: ownerTasks.filter(t => t.dueDate && new Date(t.dueDate) < new Date() && t.status !== 'completed').length,
       productivity: ownerProductivity,
       isOwner: true
     });
@@ -214,9 +224,9 @@ exports.getTeamStats = async (req, res) => {
     res.json({
       success: true,
       project: {
-        _id: project._id,
-        title: project.title,
-        progress: project.progress
+        _id: projectRow.id,
+        title: projectRow.title,
+        progress: projectRow.progress
       },
       teamStats: teamStats.sort((a, b) => b.productivity - a.productivity)
     });

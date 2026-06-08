@@ -1,6 +1,27 @@
-const Task = require('../models/Task');
-const Project = require('../models/Project');
-const User = require('../models/User');
+const { supabase } = require('../config/supabase');
+const { hydrateTasks, hydrateProjects } = require('../services/repository');
+const { toCamelUser } = require('../services/formatters');
+
+async function getAccessibleProjectIds(user) {
+  if (user.role === 'admin') {
+    const { data, error } = await supabase.from('projects').select('id');
+    if (error) throw error;
+    return (data || []).map(project => project.id);
+  }
+
+  const [owned, memberships] = await Promise.all([
+    supabase.from('projects').select('id').eq('created_by', user.id),
+    supabase.from('project_members').select('project_id').eq('user_id', user.id)
+  ]);
+
+  if (owned.error) throw owned.error;
+  if (memberships.error) throw memberships.error;
+
+  return [
+    ...(owned.data || []).map(project => project.id),
+    ...(memberships.data || []).map(member => member.project_id)
+  ];
+}
 
 exports.globalSearch = async (req, res) => {
   try {
@@ -13,19 +34,14 @@ exports.globalSearch = async (req, res) => {
       });
     }
 
-    const query = new RegExp(q, 'i');
-    const userId = req.user.id;
-    const isAdmin = req.user.role === 'admin';
-
-    let projectIds = [];
-
-    if (projectId) {
-      projectIds = [projectId];
-    } else if (!isAdmin) {
-      const userProjects = await Project.find({
-        $or: [{ createdBy: userId }, { 'members.user': userId }]
-      }).select('_id');
-      projectIds = userProjects.map(p => p._id);
+    const accessible = await getAccessibleProjectIds(req.user);
+    const projectIds = projectId ? [projectId] : accessible;
+    if (projectId && req.user.role !== 'admin' && !accessible.includes(projectId)) {
+      return res.json({
+        success: true,
+        results: { tasks: [], projects: [], users: [] },
+        query: q
+      });
     }
 
     const results = {
@@ -35,72 +51,55 @@ exports.globalSearch = async (req, res) => {
     };
 
     if (!type || type === 'task') {
-      const taskFilter = {
-        $or: [
-          { title: query },
-          { description: query }
-        ]
-      };
-
-      if (projectIds.length > 0) {
-        taskFilter.projectId = { $in: projectIds };
-      }
-      if (status) taskFilter.status = status;
-      if (priority) taskFilter.priority = priority;
-      if (assignedTo) taskFilter.assignedTo = assignedTo;
-
-      const tasks = await Task.find(taskFilter)
-        .populate('assignedTo', 'name email avatar')
-        .populate('projectId', 'title')
+      if (req.user.role !== 'admin' && projectIds.length === 0) {
+        results.tasks = [];
+      } else {
+      let query = supabase
+        .from('tasks')
+        .select('*')
+        .or(`title.ilike.%${q}%,description.ilike.%${q}%`)
         .limit(20);
 
-      results.tasks = tasks;
+      if (projectIds.length > 0) query = query.in('project_id', projectIds);
+      if (status) query = query.eq('status', status);
+      if (priority) query = query.eq('priority', priority);
+      if (assignedTo) query = query.eq('assignee_id', assignedTo);
+
+      const { data, error } = await query;
+      if (error) throw error;
+      results.tasks = await hydrateTasks(data || []);
+      }
     }
 
     if (!type || type === 'project') {
-      const searchFilter = {
-        $or: [
-          { title: query },
-          { description: query }
-        ]
-      };
-
-      let projectFilter = searchFilter;
-      if (!isAdmin) {
-        projectFilter = {
-          $and: [
-            searchFilter,
-            {
-              $or: [
-                { createdBy: userId },
-                { 'members.user': userId }
-              ]
-            }
-          ]
-        };
-      }
-
-      const projects = await Project.find(projectFilter)
-        .populate('members.user', 'name email avatar')
-        .populate('createdBy', 'name email avatar')
+      if (req.user.role !== 'admin' && accessible.length === 0) {
+        results.projects = [];
+      } else {
+      let query = supabase
+        .from('projects')
+        .select('*')
+        .or(`title.ilike.%${q}%,description.ilike.%${q}%`)
         .limit(10);
 
-      results.projects = projects;
+      if (req.user.role !== 'admin') {
+        query = query.in('id', accessible);
+      }
+
+      const { data, error } = await query;
+      if (error) throw error;
+      results.projects = await hydrateProjects(data || []);
+      }
     }
 
     if (!type || type === 'user') {
-      const userFilter = {
-        $or: [
-          { name: query },
-          { email: query }
-        ]
-      };
-
-      const users = await User.find(userFilter)
-        .select('name email avatar role')
+      const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .or(`name.ilike.%${q}%,email.ilike.%${q}%`)
         .limit(10);
 
-      results.users = users;
+      if (error) throw error;
+      results.users = (data || []).map(user => toCamelUser(user));
     }
 
     res.json({
@@ -122,57 +121,41 @@ exports.searchTasks = async (req, res) => {
   try {
     const { q, projectId, status, priority, assignedTo, dueBefore, dueAfter } = req.query;
 
-    const filter = {};
-    const userId = req.user.id;
+    let query = supabase.from('tasks').select('*').order('created_at', { ascending: false });
+    const accessible = await getAccessibleProjectIds(req.user);
 
     if (req.user.role !== 'admin') {
-      const userProjects = await Project.find({
-        $or: [{ createdBy: userId }, { 'members.user': userId }]
-      }).select('_id');
-      filter.projectId = { $in: userProjects.map(project => project._id) };
-    }
-
-    if (q) {
-      filter.$or = [
-        { title: new RegExp(q, 'i') },
-        { description: new RegExp(q, 'i') }
-      ];
-    }
-
-    if (projectId) {
-      if (filter.projectId?.$in && !filter.projectId.$in.some(id => id.toString() === projectId)) {
+      if (projectId && !accessible.includes(projectId)) {
         return res.json({
           success: true,
           tasks: [],
           total: 0
         });
       }
-      filter.projectId = projectId;
+      if (accessible.length === 0) {
+        return res.json({
+          success: true,
+          tasks: [],
+          total: 0
+        });
+      }
+      query = query.in('project_id', accessible);
     }
 
-    if (status) {
-      filter.status = status;
+    if (q) {
+      query = query.or(`title.ilike.%${q}%,description.ilike.%${q}%`);
     }
+    if (projectId) query = query.eq('project_id', projectId);
+    if (status) query = query.eq('status', status);
+    if (priority) query = query.eq('priority', priority);
+    if (assignedTo) query = query.eq('assignee_id', assignedTo);
+    if (dueBefore) query = query.lte('due_date', dueBefore);
+    if (dueAfter) query = query.gte('due_date', dueAfter);
 
-    if (priority) {
-      filter.priority = priority;
-    }
+    const { data, error } = await query;
+    if (error) throw error;
 
-    if (assignedTo) {
-      filter.assignedTo = assignedTo;
-    }
-
-    if (dueBefore || dueAfter) {
-      filter.dueDate = {};
-      if (dueBefore) filter.dueDate.$lte = new Date(dueBefore);
-      if (dueAfter) filter.dueDate.$gte = new Date(dueAfter);
-    }
-
-    const tasks = await Task.find(filter)
-      .populate('assignedTo', 'name email avatar')
-      .populate('createdBy', 'name email avatar')
-      .populate('projectId', 'title')
-      .sort({ createdAt: -1 });
+    const tasks = await hydrateTasks(data || []);
 
     res.json({
       success: true,
@@ -191,41 +174,33 @@ exports.searchTasks = async (req, res) => {
 
 exports.getFilters = async (req, res) => {
   try {
-    const { projectId } = req.query;
+    const accessible = await getAccessibleProjectIds(req.user);
+    const { data: taskRows, error } = await supabase
+      .from('tasks')
+      .select('status, priority, assignee_id, project_id')
+      .in('project_id', accessible.length ? accessible : ['00000000-0000-0000-0000-000000000000']);
 
-    const filter = {};
-    let projectFilter = {};
-    if (projectId) filter.projectId = projectId;
+    if (error) throw error;
 
-    if (req.user.role !== 'admin') {
-      const userProjects = await Project.find({
-        $or: [{ createdBy: req.user.id }, { 'members.user': req.user.id }]
-      }).select('_id title');
-      const projectIds = userProjects.map(project => project._id);
+    const usersRes = await supabase.from('users').select('*');
+    const projectsRes = await supabase.from('projects').select('*').in('id', accessible);
 
-      if (projectId && !projectIds.some(id => id.toString() === projectId)) {
-        return res.status(403).json({
-          success: false,
-          message: 'Not authorized to access filters for this project'
-        });
-      }
+    if (usersRes.error) throw usersRes.error;
+    if (projectsRes.error) throw projectsRes.error;
 
-      filter.projectId = projectId || { $in: projectIds };
-      projectFilter = { _id: { $in: projectIds } };
-    }
-
-    const statuses = await Task.distinct('status', filter);
-    const priorities = await Task.distinct('priority', filter);
-    const users = await User.find().select('name email avatar role');
-    const projects = await Project.find(projectFilter).select('title');
+    const statuses = [...new Set((taskRows || []).map(task => task.status))].sort();
+    const priorities = [...new Set((taskRows || []).map(task => task.priority))].sort();
 
     res.json({
       success: true,
       filters: {
-        statuses: statuses.sort(),
-        priorities: priorities.sort(),
-        users,
-        projects
+        statuses,
+        priorities,
+        users: (usersRes.data || []).map(user => toCamelUser(user)),
+        projects: (projectsRes.data || []).map(project => ({
+          _id: project.id,
+          title: project.title
+        }))
       }
     });
   } catch (error) {

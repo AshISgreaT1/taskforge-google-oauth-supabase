@@ -1,84 +1,116 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const { OAuth2Client } = require('google-auth-library');
+const { supabase } = require('../config/supabase');
+const { toCamelUser } = require('../services/formatters');
 
-const JOB_ROLES = ['team-lead', 'frontend-dev', 'backend-dev', 'qa', 'designer', 'member'];
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, {
+const generateToken = (user) => {
+  return jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRE || '7d'
   });
 };
 
-exports.signup = async (req, res) => {
-  try {
-    console.log('SIGNUP REQUEST:', {
-      body: req.body,
-      authHeader: req.headers.authorization
-    });
-    const { name, email, password } = req.body;
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'User already exists with this email'
-      });
-    }
+const toUserPayload = (user) => ({
+  id: user._id || user.id,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  avatar: user.avatar,
+  avatarUrl: user.avatarUrl,
+  isActive: user.isActive
+});
 
-    const user = await User.create({
+async function findOrCreateGoogleUser(profile) {
+  const googleId = profile.sub;
+  const email = profile.email;
+  const name = profile.name || profile.given_name || email.split('@')[0];
+  const avatarUrl = profile.picture || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name)}`;
+
+  const { data: existingByGoogle, error: byGoogleError } = await supabase
+    .from('users')
+    .select('*')
+    .eq('google_id', googleId)
+    .maybeSingle();
+
+  if (byGoogleError) throw byGoogleError;
+
+  if (existingByGoogle) {
+    const { data: updated, error: updateError } = await supabase
+      .from('users')
+      .update({
+        name,
+        email,
+        avatar_url: avatarUrl
+      })
+      .eq('id', existingByGoogle.id)
+      .select('*')
+      .single();
+
+    if (updateError) throw updateError;
+    return updated;
+  }
+
+  const { data: existingByEmail, error: byEmailError } = await supabase
+    .from('users')
+    .select('*')
+    .eq('email', email)
+    .maybeSingle();
+
+  if (byEmailError) throw byEmailError;
+
+  if (existingByEmail) {
+    const { data: updated, error: updateError } = await supabase
+      .from('users')
+      .update({
+        google_id: googleId,
+        name,
+        avatar_url: avatarUrl
+      })
+      .eq('id', existingByEmail.id)
+      .select('*')
+      .single();
+
+    if (updateError) throw updateError;
+    return updated;
+  }
+
+  const { data: created, error: createError } = await supabase
+    .from('users')
+    .insert([{
+      google_id: googleId,
       name,
       email,
-      password,
+      avatar_url: avatarUrl,
       role: 'member',
-      jobRole: 'member'
-    });
+      is_active: true
+    }])
+    .select('*')
+    .single();
 
-    const token = generateToken(user._id);
+  if (createError) throw createError;
+  return created;
+}
 
-    res.status(201).json({
-      success: true,
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        jobRole: user.jobRole,
-        isActive: user.isActive,
-        avatar: user.avatar
-      }
-    });
-  } catch (error) {
-    console.error('Signup error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error creating user',
-      error: error.message
-    });
-  }
-};
-
-exports.login = async (req, res) => {
+exports.googleLogin = async (req, res) => {
   try {
-    console.log('LOGIN REQUEST:', {
-      body: req.body,
-      authHeader: req.headers.authorization
-    });
-    const { email, password } = req.body;
-    if (!email || !password) {
+    const { credential } = req.body;
+
+    if (!credential) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide email and password'
+        message: 'Google credential is required'
       });
     }
 
-    const user = await User.findOne({ email }).select('+password');
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID
+    });
 
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
-    }
+    const payload = ticket.getPayload();
+    const userRow = await findOrCreateGoogleUser(payload);
+    const user = toCamelUser(userRow);
 
     if (user.isActive === false) {
       return res.status(403).json({
@@ -87,59 +119,42 @@ exports.login = async (req, res) => {
       });
     }
 
-    const isMatch = await user.matchPassword(password);
-    if (!isMatch) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials'
-      });
-    }
+    const token = generateToken(user);
 
-    const token = generateToken(user._id);
     res.json({
       success: true,
       token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        jobRole: user.jobRole,
-        isActive: user.isActive,
-        avatar: user.avatar
-      }
+      user: toUserPayload(user)
     });
   } catch (error) {
-    console.error('Login error:', {
-      error: error.message,
-      stack: error.stack,
-      requestBody: req.body,
-      authHeader: req.headers.authorization
-    });
+    console.error('Google login error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error logging in',
+      message: 'Google authentication failed',
       error: error.message
     });
   }
 };
 
+exports.login = async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    message: 'Email/password login is disabled. Use Google Sign-In.'
+  });
+};
+
+exports.signup = async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    message: 'Email/password signup is disabled. Use Google Sign-In.'
+  });
+};
+
 exports.getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id);
-
     res.json({
       success: true,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        jobRole: user.jobRole,
-        isActive: user.isActive,
-        avatar: user.avatar,
-        createdAt: user.createdAt
-      }
+      user: toUserPayload(req.user)
     });
   } catch (error) {
     console.error(error);
@@ -153,11 +168,16 @@ exports.getMe = async (req, res) => {
 
 exports.getAllUsers = async (req, res) => {
   try {
-    const users = await User.find().select('-password');
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
 
     res.json({
       success: true,
-      users
+      users: (data || []).map(row => toUserPayload(toCamelUser(row)))
     });
   } catch (error) {
     console.error(error);
@@ -172,7 +192,7 @@ exports.getAllUsers = async (req, res) => {
 exports.updateUserRole = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { role, jobRole, isActive } = req.body;
+    const { role, isActive } = req.body;
 
     if (req.user.role !== 'admin') {
       return res.status(403).json({
@@ -181,45 +201,23 @@ exports.updateUserRole = async (req, res) => {
       });
     }
 
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
+    const updates = {};
+    if (role) updates.role = role;
+    if (isActive !== undefined) updates.is_active = isActive;
 
-    if (role && !['admin', 'member'].includes(role)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid account role'
-      });
-    }
+    const { data, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', userId)
+      .select('*')
+      .single();
 
-    if (jobRole && !JOB_ROLES.includes(jobRole)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid job role'
-      });
-    }
-
-    if (role) user.role = role;
-    if (jobRole) user.jobRole = jobRole;
-    if (isActive !== undefined) user.isActive = isActive;
-
-    await user.save();
+    if (error) throw error;
 
     res.json({
       success: true,
       message: 'User role updated successfully',
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        jobRole: user.jobRole,
-        isActive: user.isActive
-      }
+      user: toUserPayload(toCamelUser(data))
     });
   } catch (error) {
     console.error(error);
@@ -240,50 +238,40 @@ exports.createUser = async (req, res) => {
       });
     }
 
-    const { name, email, password, role, jobRole, isActive } = req.body;
+    const { name, email, role } = req.body;
 
-    if (role && !['admin', 'member'].includes(role)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid account role'
-      });
-    }
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .maybeSingle();
 
-    if (jobRole && !JOB_ROLES.includes(jobRole)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid job role'
-      });
-    }
-
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
+    if (existing) {
       return res.status(400).json({
         success: false,
         message: 'User already exists with this email'
       });
     }
 
-    const user = await User.create({
-      name,
-      email,
-      password,
-      role: role || 'member',
-      jobRole: jobRole || 'member',
-      isActive: isActive !== undefined ? isActive : true
-    });
+    const { data, error } = await supabase
+      .from('users')
+      .insert([{
+        name,
+        email,
+        role: role || 'member',
+        google_id: null,
+        avatar_url: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name || email)}`,
+        is_active: true
+      }])
+      .select('*')
+      .single();
+
+    if (error) throw error;
 
     res.status(201).json({
       success: true,
       message: 'User created successfully',
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        jobRole: user.jobRole,
-        isActive: user.isActive
-      }
+      user: toUserPayload(toCamelUser(data))
     });
   } catch (error) {
     console.error(error);
@@ -314,23 +302,21 @@ exports.disableUser = async (req, res) => {
       });
     }
 
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { isActive: isActive !== undefined ? isActive : false },
-      { new: true, runValidators: true }
-    ).select('-password');
+    const { data, error } = await supabase
+      .from('users')
+      .update({ is_active: isActive !== undefined ? isActive : false })
+      .eq('id', userId)
+      .select('*')
+      .single();
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
+    if (error) throw error;
+
+    const user = toCamelUser(data);
 
     res.json({
       success: true,
       message: user.isActive ? 'User enabled successfully' : 'User disabled successfully',
-      user
+      user: toUserPayload(user)
     });
   } catch (error) {
     console.error(error);
@@ -360,14 +346,12 @@ exports.deleteUser = async (req, res) => {
       });
     }
 
-    const user = await User.findByIdAndDelete(userId);
+    const { error } = await supabase
+      .from('users')
+      .delete()
+      .eq('id', userId);
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
+    if (error) throw error;
 
     res.json({
       success: true,

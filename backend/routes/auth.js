@@ -3,6 +3,7 @@ const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const { protect } = require('../middleware/auth');
 const {
+  googleLogin,
   signup,
   login,
   getMe,
@@ -25,36 +26,13 @@ const validate = (req, res, next) => {
 };
 
 router.post(
-  '/signup',
-  [
-    body('name').trim().notEmpty().withMessage('Name is required'),
-    body('email').isEmail().withMessage('Valid email is required'),
-    body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-    body('role').not().exists().withMessage('Role cannot be set during signup'),
-    body('jobRole').not().exists().withMessage('Job role cannot be set during signup')
-  ],
+  '/google',
   validate,
-  (req, res, next) => {
-    console.log('AUTH ROUTE HIT /signup', req.method, req.originalUrl, req.body && { email: req.body.email });
-    next();
-  },
-  signup
+  googleLogin
 );
 
-router.post(
-  '/login',
-  [
-    body('email').isEmail().withMessage('Valid email is required'),
-    body('password').notEmpty().withMessage('Password is required')
-  ],
-  validate,
-  (req, res, next) => {
-    console.log('AUTH ROUTE HIT /login', req.method, req.originalUrl, req.body && { email: req.body.email });
-    next();
-  },
-  login
-);
-
+router.post('/signup', signup);
+router.post('/login', login);
 router.get('/me', protect, getMe);
 router.get('/users', protect, getAllUsers);
 router.post(
@@ -63,9 +41,7 @@ router.post(
   [
     body('name').trim().notEmpty().withMessage('Name is required'),
     body('email').isEmail().withMessage('Valid email is required'),
-    body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
     body('role').optional().isIn(['admin', 'member']),
-    body('jobRole').optional().isIn(['team-lead', 'frontend-dev', 'backend-dev', 'qa', 'designer', 'member'])
   ],
   validate,
   createUser
@@ -75,7 +51,6 @@ router.patch(
   protect,
   [
     body('role').optional().isIn(['admin', 'member']),
-    body('jobRole').optional().isIn(['team-lead', 'frontend-dev', 'backend-dev', 'qa', 'designer', 'member']),
     body('isActive').optional().isBoolean()
   ],
   validate,

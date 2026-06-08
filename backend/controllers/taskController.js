@@ -1,7 +1,16 @@
-const Task = require('../models/Task');
-const Project = require('../models/Project');
-const User = require('../models/User');
+const { supabase } = require('../config/supabase');
 const notificationController = require('./notificationController');
+const { sendEmail } = require('../services/emailService');
+const {
+  getTasksByFilter,
+  hydrateTask,
+  hydrateTasks,
+  hydrateProject,
+  getProjectMembers,
+  getUsersByIds,
+  createActivity
+} = require('../services/repository');
+const { toCamelUser } = require('../services/formatters');
 
 const aiSubtasks = {
   'build landing page': [
@@ -55,7 +64,7 @@ const aiSubtasks = {
     'Implement session management',
     'Security testing'
   ],
-  'default': [
+  default: [
     'Research and planning',
     'Design phase',
     'Implementation',
@@ -97,15 +106,10 @@ function predictDelay(project, tasks) {
 
   if (totalTasks === 0 || completedTasks === totalTasks) return null;
 
-  const progressRatio = completedTasks / totalTasks;
-  const timeElapsed = (now - new Date(project.createdAt)) / (endDate - new Date(project.createdAt));
-
   const timeRemaining = endDate - now;
   const daysRemaining = Math.ceil(timeRemaining / (1000 * 60 * 60 * 24));
-
   const tasksRemaining = totalTasks - completedTasks;
   const avgTasksPerDay = completedTasks / Math.max(1, (now - new Date(project.createdAt)) / (1000 * 60 * 60 * 24));
-
   const predictedDaysNeeded = avgTasksPerDay > 0 ? tasksRemaining / avgTasksPerDay : tasksRemaining * 2;
 
   if (predictedDaysNeeded > daysRemaining && overdueTasks > 0) {
@@ -120,45 +124,118 @@ function predictDelay(project, tasks) {
   return null;
 }
 
+async function getAccessibleProjectIds(user) {
+  if (user.role === 'admin') {
+    const { data, error } = await supabase.from('projects').select('id');
+    if (error) throw error;
+    return (data || []).map(project => project.id);
+  }
+
+  const [owned, memberships] = await Promise.all([
+    supabase.from('projects').select('id').eq('created_by', user.id),
+    supabase.from('project_members').select('project_id').eq('user_id', user.id)
+  ]);
+
+  if (owned.error) throw owned.error;
+  if (memberships.error) throw memberships.error;
+
+  return [
+    ...(owned.data || []).map(project => project.id),
+    ...(memberships.data || []).map(member => member.project_id)
+  ];
+}
+
+async function fetchTasksForProject(projectId) {
+  const rows = await getTasksByFilter({ projectId });
+  return hydrateTasks(rows);
+}
+
+async function refreshProjectProgress(projectId) {
+  const { data: tasks, error } = await supabase
+    .from('tasks')
+    .select('id, status')
+    .eq('project_id', projectId);
+
+  if (error) throw error;
+
+  const all = tasks || [];
+  const progress = all.length === 0 ? 0 : Math.round((all.filter(task => task.status === 'completed').length / all.length) * 100);
+
+  const updates = { progress };
+  if (progress === 100) {
+    updates.status = 'completed';
+  }
+
+  const { error: updateError } = await supabase
+    .from('projects')
+    .update(updates)
+    .eq('id', projectId);
+
+  if (updateError) throw updateError;
+}
+
+function getAllowedNextStatuses(task, user) {
+  const isAdmin = user.role === 'admin';
+  const isAssigned = task.assignedTo?._id === user.id;
+  const isCreator = task.createdBy?._id === user.id;
+
+  if (!isAdmin && !isAssigned && !isCreator) return [];
+  if (task.status === 'todo') return ['in-progress'];
+  if (task.status === 'in-progress') return ['pending-approval', 'completed'];
+  if (task.status === 'pending-approval') return ['pending-approval', 'completed', 'in-progress'];
+  return ['completed'];
+}
+
+async function notifyTaskRecipients(task, senderId, type, title, message, sendMail = true) {
+  const recipients = new Map();
+  if (task.assignedTo?._id) recipients.set(task.assignedTo._id, task.assignedTo);
+  if (task.createdBy?._id) recipients.set(task.createdBy._id, task.createdBy);
+
+  for (const [recipientId, recipient] of recipients.entries()) {
+    if (recipientId === senderId) continue;
+
+    await notificationController.createNotification({
+      recipient: recipientId,
+      sender: senderId,
+      type,
+      title,
+      message,
+      projectId: task.projectId?._id,
+      taskId: task._id
+    });
+
+    if (sendMail && recipient.email) {
+      await sendEmail({
+        to: recipient.email,
+        subject: title,
+        text: message,
+        html: `<p>${message}</p><p><strong>Task:</strong> ${task.title}</p>`
+      });
+    }
+  }
+}
+
 exports.getTasks = async (req, res) => {
   try {
     const { projectId, status, priority, assignedTo } = req.query;
+    const allowedProjectIds = await getAccessibleProjectIds(req.user);
 
-    const filter = {};
-
-    let allowedProjectIds = null;
-
-    if (req.user.role !== 'admin') {
-      const userProjects = await Project.find({
-        $or: [
-          { createdBy: req.user.id },
-          { 'members.user': req.user.id }
-        ]
-      }).select('_id');
-
-      allowedProjectIds = userProjects.map(project => project._id.toString());
-      filter.projectId = { $in: allowedProjectIds };
+    if (projectId && !allowedProjectIds.includes(projectId)) {
+      return res.json({ success: true, tasks: [] });
     }
 
-    if (projectId) {
-      if (allowedProjectIds && !allowedProjectIds.includes(projectId)) {
-        return res.json({
-          success: true,
-          tasks: []
-        });
-      }
-      filter.projectId = projectId;
-    }
-    if (status) filter.status = status;
-    if (priority) filter.priority = priority;
-    if (assignedTo) filter.assignedTo = assignedTo;
+    const rows = await getTasksByFilter({
+      projectId: projectId || undefined,
+      status: status || undefined,
+      priority: priority || undefined,
+      assignedTo: assignedTo || undefined
+    });
 
-    const tasks = await Task.find(filter)
-      .populate('assignedTo', 'name email avatar')
-      .populate('createdBy', 'name email avatar')
-      .populate('projectId', 'title')
-      .sort({ createdAt: -1 });
+    const filteredRows = req.user.role === 'admin'
+      ? rows
+      : rows.filter(task => allowedProjectIds.includes(task.project_id));
 
+    const tasks = await hydrateTasks(filteredRows);
     res.json({
       success: true,
       tasks
@@ -175,30 +252,40 @@ exports.getTasks = async (req, res) => {
 
 exports.getTask = async (req, res) => {
   try {
-    const task = await Task.findById(req.params.id)
-      .populate('assignedTo', 'name email avatar')
-      .populate('createdBy', 'name email avatar')
-      .populate('projectId', 'title description members')
-      .populate('parentTask', 'title status');
+    const { data, error } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!task) {
+    if (error) throw error;
+
+    if (!data) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
-    const hasAccess = await canAccessTask(task, req.user);
-    if (!hasAccess) {
+    const task = await hydrateTask(data);
+    const projectId = task.projectId?._id || task.projectId;
+    const allowedProjectIds = await getAccessibleProjectIds(req.user);
+    if (req.user.role !== 'admin' && !allowedProjectIds.includes(projectId)) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to access this task'
       });
     }
 
-    const subtasks = await Task.find({ parentTask: task._id })
-      .populate('assignedTo', 'name email avatar')
-      .populate('createdBy', 'name email avatar');
+    const { data: subtaskRows, error: subtaskError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('parent_task_id', req.params.id)
+      .order('created_at', { ascending: false });
+
+    if (subtaskError) throw subtaskError;
+
+    const subtasks = await hydrateTasks(subtaskRows || []);
 
     res.json({
       success: true,
@@ -226,69 +313,84 @@ exports.createTask = async (req, res) => {
       });
     }
 
-    const project = await Project.findById(projectId);
-    if (!project) {
+    const { data: projectRow, error: projectError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    if (projectError) throw projectError;
+    if (!projectRow) {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
       });
     }
 
-    const mainTask = await Task.create({
-      title,
-      description,
-      assignedTo,
-      priority: priority || 'medium',
-      status: 'todo',
-      dueDate,
-      projectId,
-      createdBy: req.user.id
+    const { data: taskRow, error: taskError } = await supabase
+      .from('tasks')
+      .insert([{
+        title,
+        description,
+        assignee_id: assignedTo || null,
+        priority: priority || 'medium',
+        status: 'todo',
+        due_date: dueDate || null,
+        project_id: projectId,
+        creator_id: req.user.id
+      }])
+      .select('*')
+      .single();
+
+    if (taskError) throw taskError;
+
+    await createActivity({
+      taskId: taskRow.id,
+      userId: req.user.id,
+      action: 'task_created',
+      newData: taskRow
     });
 
     let subtasks = [];
     if (generateAI) {
       const subtaskTitles = generateSubtasks(title);
       for (const subtaskTitle of subtaskTitles) {
-        const subtask = await Task.create({
-          title: subtaskTitle,
-          description: `Subtask of: ${title}`,
-          assignedTo,
-          priority: priority || 'medium',
-          status: 'todo',
-          dueDate,
-          projectId,
-          createdBy: req.user.id,
-          isSubtask: true,
-          parentTask: mainTask._id
-        });
-        subtasks.push(subtask);
+        const { data: subtaskRow, error: subtaskError } = await supabase
+          .from('tasks')
+          .insert([{
+            title: subtaskTitle,
+            description: `Subtask of: ${title}`,
+            assignee_id: assignedTo || null,
+            priority: priority || 'medium',
+            status: 'todo',
+            due_date: dueDate || null,
+            project_id: projectId,
+            creator_id: req.user.id,
+            is_subtask: true,
+            parent_task_id: taskRow.id
+          }])
+          .select('*')
+          .single();
+
+        if (subtaskError) throw subtaskError;
+        subtasks.push(subtaskRow);
       }
     }
 
-    const task = await Task.findById(mainTask._id)
-      .populate('assignedTo', 'name email avatar')
-      .populate('createdBy', 'name email avatar')
-      .populate('projectId', 'title');
+    const task = await hydrateTask(taskRow);
+    const hydratedSubtasks = await hydrateTasks(subtasks);
 
-    await updateProjectProgress(projectId);
+    await refreshProjectProgress(projectId);
 
     if (assignedTo) {
-      await notificationController.createNotification({
-        recipient: assignedTo,
-        sender: req.user.id,
-        type: 'task_assigned',
-        title: 'Task Assigned',
-        message: `You have been assigned "${task.title}"`,
-        projectId,
-        taskId: task._id
-      });
+      await notifyTaskRecipients(task, req.user.id, 'task_assigned', 'Task Assigned', `You have been assigned "${task.title}"`);
     }
 
     res.status(201).json({
       success: true,
       task,
-      subtasks,
-      aiGenerated: generateAI ? subtasks.length > 0 : false
+      subtasks: hydratedSubtasks,
+      aiGenerated: generateAI ? hydratedSubtasks.length > 0 : false
     });
   } catch (error) {
     console.error(error);
@@ -304,9 +406,14 @@ exports.updateTask = async (req, res) => {
   try {
     const { title, description, assignedTo, priority, dueDate, status } = req.body;
 
-    let task = await Task.findById(req.params.id);
+    const { data: taskRow, error: taskError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!task) {
+    if (taskError) throw taskError;
+    if (!taskRow) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
@@ -319,39 +426,75 @@ exports.updateTask = async (req, res) => {
         message: 'Only admins can edit tasks'
       });
     }
-    const previousAssignedTo = task.assignedTo?.toString();
+
+    const currentTask = await hydrateTask(taskRow);
+    const previousAssignedTo = currentTask.assignedTo?._id;
 
     if (status) {
-      const allowed = getAllowedNextStatuses(task, req.user);
+      const allowed = getAllowedNextStatuses(currentTask, req.user);
       if (!allowed.includes(status)) {
         return res.status(403).json({
           success: false,
-          message: `Cannot move task from ${task.status} to ${status}`
+          message: `Cannot move task from ${currentTask.status} to ${status}`
         });
       }
     }
 
-    task = await Task.findByIdAndUpdate(
-      req.params.id,
-      normalizeTaskUpdate({ title, description, assignedTo, priority, dueDate, status }, task, req.user),
-      { new: true, runValidators: true }
-    )
-    .populate('assignedTo', 'name email avatar')
-    .populate('createdBy', 'name email avatar')
-    .populate('projectId', 'title');
+    const updates = {};
+    if (title !== undefined) updates.title = title;
+    if (description !== undefined) updates.description = description;
+    if (assignedTo !== undefined) updates.assignee_id = assignedTo || null;
+    if (priority !== undefined) updates.priority = priority;
+    if (dueDate !== undefined) updates.due_date = dueDate || null;
+    if (status !== undefined) updates.status = status;
 
-    await updateProjectProgress(task.projectId);
+    if (status === 'completed') {
+      updates.approval_status = 'approved';
+      updates.completed_at = new Date().toISOString();
+      updates.approved_by = req.user.id;
+    }
+
+    const { data: updatedRow, error: updateError } = await supabase
+      .from('tasks')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (updateError) throw updateError;
+
+    await createActivity({
+      taskId: updatedRow.id,
+      userId: req.user.id,
+      action: status && status !== currentTask.status ? 'status_changed' : 'task_updated',
+      previousData: taskRow,
+      newData: updatedRow
+    });
+
+    const task = await hydrateTask(updatedRow);
+
+    await refreshProjectProgress(task.projectId._id);
 
     if (assignedTo && assignedTo !== previousAssignedTo) {
-      await notificationController.createNotification({
-        recipient: assignedTo,
-        sender: req.user.id,
-        type: 'task_assigned',
-        title: 'Task Assigned',
-        message: `You have been assigned "${task.title}"`,
-        projectId: task.projectId,
-        taskId: task._id
+      await createActivity({
+        taskId: task._id,
+        userId: req.user.id,
+        action: 'task_assigned',
+        previousData: { assignedTo: previousAssignedTo },
+        newData: { assignedTo }
       });
+      await notifyTaskRecipients(task, req.user.id, 'task_assigned', 'Task Assigned', `You have been assigned "${task.title}"`);
+    }
+
+    if (status === 'completed') {
+      await createActivity({
+        taskId: task._id,
+        userId: req.user.id,
+        action: 'task_completed',
+        previousData: taskRow,
+        newData: updatedRow
+      });
+      await notifyTaskRecipients(task, req.user.id, 'task_completed', 'Task Completed', `"${task.title}" has been completed`);
     }
 
     res.json({
@@ -372,23 +515,21 @@ exports.updateTaskStatus = async (req, res) => {
   try {
     const { status } = req.body;
 
-    let task = await Task.findById(req.params.id);
+    const { data: taskRow, error: taskError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!task) {
+    if (taskError) throw taskError;
+    if (!taskRow) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
-    const hasAccess = await canAccessTask(task, req.user);
-    if (!hasAccess) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to update this task'
-      });
-    }
-
+    const task = await hydrateTask(taskRow);
     const allowed = getAllowedNextStatuses(task, req.user);
     if (!allowed.includes(status)) {
       return res.status(403).json({
@@ -397,31 +538,43 @@ exports.updateTaskStatus = async (req, res) => {
       });
     }
 
-    task = await Task.findByIdAndUpdate(
-      req.params.id,
-      normalizeTaskUpdate({ status }, task, req.user),
-      { new: true, runValidators: true }
-    )
-    .populate('assignedTo', 'name email avatar')
-    .populate('createdBy', 'name email avatar')
-    .populate('projectId', 'title');
+    const updates = { status };
+    if (status === 'completed') {
+      updates.approval_status = 'approved';
+      updates.completed_at = new Date().toISOString();
+      updates.approved_by = req.user.id;
+    }
+    if (status !== 'completed') {
+      updates.completed_at = null;
+    }
 
-    await updateProjectProgress(task.projectId);
+    const { data: updatedRow, error: updateError } = await supabase
+      .from('tasks')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
 
-    if (status === 'pending-approval') {
-      await notifyAdmins({
-        sender: req.user.id,
-        type: 'task_completed',
-        title: 'Task Pending Approval',
-        message: `"${task.title}" is ready for admin approval`,
-        projectId: task.projectId,
-        taskId: task._id
-      });
+    if (updateError) throw updateError;
+
+    await createActivity({
+      taskId: updatedRow.id,
+      userId: req.user.id,
+      action: status === 'completed' ? 'task_completed' : 'status_changed',
+      previousData: taskRow,
+      newData: updatedRow
+    });
+
+    const updatedTask = await hydrateTask(updatedRow);
+    await refreshProjectProgress(updatedTask.projectId._id);
+
+    if (status === 'completed') {
+      await notifyTaskRecipients(updatedTask, req.user.id, 'task_completed', 'Task Completed', `"${updatedTask.title}" has been completed`);
     }
 
     res.json({
       success: true,
-      task
+      task: updatedTask
     });
   } catch (error) {
     console.error(error);
@@ -442,19 +595,28 @@ exports.deleteTask = async (req, res) => {
       });
     }
 
-    const task = await Task.findById(req.params.id);
+    const { data: taskRow, error: taskError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!task) {
+    if (taskError) throw taskError;
+    if (!taskRow) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
-    await Task.deleteMany({ parentTask: req.params.id });
-    await task.deleteOne();
+    const { error: deleteError } = await supabase
+      .from('tasks')
+      .delete()
+      .eq('id', req.params.id);
 
-    await updateProjectProgress(task.projectId);
+    if (deleteError) throw deleteError;
+
+    await refreshProjectProgress(taskRow.project_id);
 
     res.json({
       success: true,
@@ -479,14 +641,8 @@ exports.getPendingApprovals = async (req, res) => {
       });
     }
 
-    const tasks = await Task.find({
-      status: 'pending-approval',
-      approvalStatus: 'pending'
-    })
-      .populate('assignedTo', 'name email avatar')
-      .populate('createdBy', 'name email avatar')
-      .populate('projectId', 'title')
-      .sort({ updatedAt: -1 });
+    const rows = await getTasksByFilter({ status: 'pending-approval' });
+    const tasks = await hydrateTasks(rows);
 
     res.json({
       success: true,
@@ -512,36 +668,55 @@ exports.approveTask = async (req, res) => {
     }
 
     const { note } = req.body;
-    const task = await Task.findById(req.params.id);
+    const { data: taskRow, error: taskError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!task) {
+    if (taskError) throw taskError;
+    if (!taskRow) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
-    if (task.status !== 'pending-approval') {
+    if (taskRow.status !== 'pending-approval') {
       return res.status(400).json({
         success: false,
         message: 'Only pending approval tasks can be approved'
       });
     }
 
-    task.status = 'completed';
-    task.approvalStatus = 'approved';
-    task.approvalNote = note || '';
-    task.approvedBy = req.user.id;
-    task.completedAt = Date.now();
-    await task.save();
+    const updates = {
+      status: 'completed',
+      approval_status: 'approved',
+      approval_note: note || '',
+      approved_by: req.user.id,
+      completed_at: new Date().toISOString()
+    };
 
-    await updateProjectProgress(task.projectId);
-    await notifyTaskUser(task, req.user.id, 'task_approved', 'Approval Accepted', `"${task.title}" was approved`);
+    const { data: updatedRow, error: updateError } = await supabase
+      .from('tasks')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
 
-    await task.populate('assignedTo', 'name email avatar');
-    await task.populate('createdBy', 'name email avatar');
-    await task.populate('projectId', 'title');
-    await task.populate('approvedBy', 'name email avatar');
+    if (updateError) throw updateError;
+
+    await createActivity({
+      taskId: updatedRow.id,
+      userId: req.user.id,
+      action: 'task_completed',
+      previousData: taskRow,
+      newData: updatedRow
+    });
+
+    const task = await hydrateTask(updatedRow);
+    await refreshProjectProgress(task.projectId._id);
+    await notifyTaskRecipients(task, req.user.id, 'task_completed', 'Task Approved', `"${task.title}" was approved and completed`);
 
     res.json({
       success: true,
@@ -567,36 +742,55 @@ exports.rejectTask = async (req, res) => {
     }
 
     const { note } = req.body;
-    const task = await Task.findById(req.params.id);
+    const { data: taskRow, error: taskError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!task) {
+    if (taskError) throw taskError;
+    if (!taskRow) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
-    if (task.status !== 'pending-approval') {
+    if (taskRow.status !== 'pending-approval') {
       return res.status(400).json({
         success: false,
         message: 'Only pending approval tasks can be rejected'
       });
     }
 
-    task.status = 'in-progress';
-    task.approvalStatus = 'rejected';
-    task.approvalNote = note || '';
-    task.approvedBy = req.user.id;
-    task.completedAt = undefined;
-    await task.save();
+    const updates = {
+      status: 'in-progress',
+      approval_status: 'rejected',
+      approval_note: note || '',
+      approved_by: req.user.id,
+      completed_at: null
+    };
 
-    await updateProjectProgress(task.projectId);
-    await notifyTaskUser(task, req.user.id, 'task_rejected', 'Approval Rejected', `"${task.title}" was sent back to In Progress`);
+    const { data: updatedRow, error: updateError } = await supabase
+      .from('tasks')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
 
-    await task.populate('assignedTo', 'name email avatar');
-    await task.populate('createdBy', 'name email avatar');
-    await task.populate('projectId', 'title');
-    await task.populate('approvedBy', 'name email avatar');
+    if (updateError) throw updateError;
+
+    await createActivity({
+      taskId: updatedRow.id,
+      userId: req.user.id,
+      action: 'task_updated',
+      previousData: taskRow,
+      newData: updatedRow
+    });
+
+    const task = await hydrateTask(updatedRow);
+    await refreshProjectProgress(task.projectId._id);
+    await notifyTaskRecipients(task, req.user.id, 'task_rejected', 'Approval Rejected', `"${task.title}" was sent back to In Progress`);
 
     res.json({
       success: true,
@@ -616,27 +810,37 @@ exports.getAIPrediction = async (req, res) => {
   try {
     const { projectId } = req.params;
 
-    const project = await Project.findById(projectId);
-    if (!project) {
+    const { data: projectRow, error: projectError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    if (projectError) throw projectError;
+    if (!projectRow) {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
       });
     }
 
-    if (req.user.role !== 'admin') {
-      const hasAccess = project.createdBy.toString() === req.user.id ||
-        project.members.some(member => (member.user?._id || member.user || member).toString() === req.user.id);
-
-      if (!hasAccess) {
-        return res.status(403).json({
-          success: false,
-          message: 'Not authorized to access this project'
-        });
-      }
+    const project = await hydrateProject(projectRow);
+    const allowedProjectIds = await getAccessibleProjectIds(req.user);
+    if (req.user.role !== 'admin' && !allowedProjectIds.includes(projectId)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to access this project'
+      });
     }
 
-    const tasks = await Task.find({ projectId });
+    const { data: taskRows, error: tasksError } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('project_id', projectId);
+
+    if (tasksError) throw tasksError;
+
+    const tasks = await hydrateTasks(taskRows || []);
     const prediction = predictDelay(project, tasks);
 
     res.json({
@@ -655,105 +859,3 @@ exports.getAIPrediction = async (req, res) => {
     });
   }
 };
-
-async function updateProjectProgress(projectId) {
-  const tasks = await Task.find({ projectId });
-  if (tasks.length === 0) {
-    await Project.findByIdAndUpdate(projectId, { progress: 0 });
-    return;
-  }
-  const completedTasks = tasks.filter(task => task.status === 'completed').length;
-  const progress = Math.round((completedTasks / tasks.length) * 100);
-  await Project.findByIdAndUpdate(projectId, { progress });
-
-  if (progress === 100) {
-    await Project.findByIdAndUpdate(projectId, { status: 'completed' });
-  }
-}
-
-async function canAccessTask(task, user) {
-  if (user.role === 'admin') return true;
-
-  const project = await Project.findById(task.projectId).select('createdBy members');
-  if (!project) return false;
-
-  return project.createdBy.toString() === user.id ||
-    project.members.some(member => (member.user?._id || member.user || member).toString() === user.id);
-}
-
-function normalizeTaskUpdate(updates, task, user) {
-  const payload = {};
-
-  Object.entries(updates).forEach(([key, value]) => {
-    if (value !== undefined) payload[key] = value;
-  });
-
-  if (payload.status) {
-    if (payload.status === 'pending-approval') {
-      payload.approvalStatus = 'pending';
-      payload.approvalNote = '';
-      payload.approvedBy = undefined;
-      payload.completedAt = undefined;
-    }
-
-    if (payload.status === 'completed' && user.role !== 'admin') {
-      payload.status = task.status;
-    }
-
-    if (payload.status === 'completed') {
-      payload.approvalStatus = 'approved';
-      payload.approvedBy = user.id;
-      payload.completedAt = Date.now();
-    }
-
-    if (payload.status !== 'completed') {
-      payload.completedAt = undefined;
-    }
-  }
-
-  return payload;
-}
-
-function getAllowedNextStatuses(task, user) {
-  const isAdmin = user.role === 'admin';
-  const isAssigned = task.assignedTo?.toString() === user.id;
-  const isCreator = task.createdBy?.toString() === user.id;
-
-  if (!isAdmin && !isAssigned && !isCreator) return [];
-  if (task.status === 'todo') return ['in-progress'];
-  if (task.status === 'in-progress') return ['pending-approval'];
-  if (task.status === 'pending-approval') return ['pending-approval'];
-  return ['completed'];
-}
-
-async function notifyAdmins(data) {
-  const admins = await User.find({ role: 'admin', isActive: true }).select('_id');
-  for (const admin of admins) {
-    if (admin._id.toString() !== data.sender) {
-      await notificationController.createNotification({
-        ...data,
-        recipient: admin._id
-      });
-    }
-  }
-}
-
-async function notifyTaskUser(task, sender, type, title, message) {
-  const recipients = new Set();
-  if (task.assignedTo) recipients.add(task.assignedTo.toString());
-  if (task.createdBy) recipients.add(task.createdBy.toString());
-
-  for (const recipient of recipients) {
-    if (recipient !== sender) {
-      await notificationController.createNotification({
-        recipient,
-        sender,
-        type,
-        title,
-        message,
-        projectId: task.projectId,
-        taskId: task._id
-      });
-    }
-  }
-}

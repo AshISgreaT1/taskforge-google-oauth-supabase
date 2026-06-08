@@ -2,12 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
-const connectDB = require('./config/db');
 const authRoutes = require('./routes/authRoutes');
 
 dotenv.config();
-
-console.log('BACKEND VERSION NEW -', new Date().toISOString());
 
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
@@ -49,27 +46,18 @@ setInterval(() => {
   }
 }, RATE_LIMIT_WINDOW_MS).unref();
 
-connectDB();
-
 app.use(cors({
   origin: [
-    'https://glistening-intuition-production-69a1.up.railway.app',
-    'http://localhost:5173'
+    process.env.FRONTEND_URL || 'http://localhost:5173',
+    'http://localhost:4173',
+    'https://taskforge-ai.vercel.app'
   ],
   credentials: true
 }));
 
 app.use(express.json());
 app.use('/api', apiRateLimit);
-
-app.use('/api/auth', (req, res, next) => {
-  console.log('AUTH HIT:', req.method, req.originalUrl);
-  next();
-});
-
-console.log('AUTH ROUTES LOADED:', !!authRoutes);
 app.use('/api/auth', authRoutes);
-console.log('Auth routes mounted at /api/auth');
 app.use('/api/projects', require('./routes/projects'));
 app.use('/api/tasks', require('./routes/tasks'));
 app.use('/api/dashboard', require('./routes/dashboard'));

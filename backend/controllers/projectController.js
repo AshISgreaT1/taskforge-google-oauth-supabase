@@ -1,36 +1,73 @@
-const Project = require('../models/Project');
-const Task = require('../models/Task');
+const { supabase } = require('../config/supabase');
 const notificationController = require('./notificationController');
+const {
+  hydrateProjects,
+  hydrateProject,
+  hydrateTasks,
+  getProjectMembers,
+  getUsersByIds
+} = require('../services/repository');
 
 const PROJECT_ROLES = ['team-lead', 'frontend-dev', 'backend-dev', 'qa', 'designer', 'member'];
 
-const memberUserId = (member) => (member.user?._id || member.user || member._id || member).toString();
+function memberUserId(member) {
+  return (member.user?._id || member.user || member._id || member).toString();
+}
 
-const normalizeMembers = (members = [], addedBy) => members.map(member => {
-  if (typeof member === 'string') {
-    return { user: member, role: 'member', addedBy };
+async function getAccessibleProjectIds(user) {
+  if (user.role === 'admin') {
+    const { data, error } = await supabase.from('projects').select('id');
+    if (error) throw error;
+    return (data || []).map(project => project.id);
   }
 
+  const [owned, memberships] = await Promise.all([
+    supabase.from('projects').select('id').eq('created_by', user.id),
+    supabase.from('project_members').select('project_id').eq('user_id', user.id)
+  ]);
+
+  if (owned.error) throw owned.error;
+  if (memberships.error) throw memberships.error;
+
+  return [
+    ...(owned.data || []).map(project => project.id),
+    ...(memberships.data || []).map(member => member.project_id)
+  ];
+}
+
+async function loadProjectWithRelations(projectRow) {
+  const project = await hydrateProject(projectRow);
+  if (!project) return null;
+
+  const { data: tasks, error } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('project_id', project._id)
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+
   return {
-    user: member.user || member._id || member,
-    role: PROJECT_ROLES.includes(member.role) ? member.role : 'member',
-    addedBy
+    project,
+    tasks: await hydrateTasks(tasks || [])
   };
-});
+}
 
 exports.getProjects = async (req, res) => {
   try {
-    const filter = req.user.role === 'admin' ? {} : {
-      $or: [
-        { createdBy: req.user.id },
-        { 'members.user': req.user.id }
-      ]
-    };
+    const accessible = await getAccessibleProjectIds(req.user);
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .order('updated_at', { ascending: false });
 
-    const projects = await Project.find(filter)
-    .populate('members.user', 'name email avatar role jobRole')
-    .populate('createdBy', 'name email avatar')
-    .sort({ updatedAt: -1 });
+    if (error) throw error;
+
+    const filtered = req.user.role === 'admin'
+      ? data || []
+      : (data || []).filter(project => accessible.includes(project.id));
+
+    const projects = await hydrateProjects(filtered);
 
     res.json({
       success: true,
@@ -48,35 +85,34 @@ exports.getProjects = async (req, res) => {
 
 exports.getProject = async (req, res) => {
   try {
-    const project = await Project.findById(req.params.id)
-      .populate('members.user', 'name email avatar role jobRole')
-      .populate('createdBy', 'name email avatar');
+    const { data: projectRow, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!project) {
+    if (error) throw error;
+    if (!projectRow) {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
       });
     }
 
-    const hasAccess = project.createdBy._id.toString() === req.user.id ||
-      project.members.some(member => memberUserId(member) === req.user.id);
-
-    if (!hasAccess && req.user.role !== 'admin') {
+    const accessible = await getAccessibleProjectIds(req.user);
+    if (req.user.role !== 'admin' && !accessible.includes(req.params.id)) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to access this project'
       });
     }
 
-    const tasks = await Task.find({ projectId: project._id })
-      .populate('assignedTo', 'name email avatar')
-      .populate('createdBy', 'name email avatar');
+    const loaded = await loadProjectWithRelations(projectRow);
 
     res.json({
       success: true,
-      project,
-      tasks
+      project: loaded.project,
+      tasks: loaded.tasks
     });
   } catch (error) {
     console.error(error);
@@ -99,17 +135,35 @@ exports.createProject = async (req, res) => {
       });
     }
 
-    const project = await Project.create({
-      title,
-      description,
-      members: normalizeMembers(members || [], req.user.id),
-      createdBy: req.user.id,
-      endDate
-    });
+    const { data: projectRow, error } = await supabase
+      .from('projects')
+      .insert([{
+        title,
+        description,
+        created_by: req.user.id,
+        end_date: endDate || null
+      }])
+      .select('*')
+      .single();
 
-    await project.populate('members.user', 'name email avatar role jobRole');
-    await project.populate('createdBy', 'name email avatar');
+    if (error) throw error;
 
+    if (Array.isArray(members) && members.length > 0) {
+      const memberRows = members.map(member => ({
+        project_id: projectRow.id,
+        user_id: member.user || member.user_id || member,
+        role: PROJECT_ROLES.includes(member.role) ? member.role : 'member',
+        added_by: req.user.id
+      }));
+
+      const { error: memberError } = await supabase
+        .from('project_members')
+        .insert(memberRows);
+
+      if (memberError) throw memberError;
+    }
+
+    const project = await hydrateProject(projectRow);
     res.status(201).json({
       success: true,
       project
@@ -128,15 +182,6 @@ exports.updateProject = async (req, res) => {
   try {
     const { title, description, members, status, endDate } = req.body;
 
-    let project = await Project.findById(req.params.id);
-
-    if (!project) {
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
-    }
-
     if (req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
@@ -144,16 +189,52 @@ exports.updateProject = async (req, res) => {
       });
     }
 
-    const updates = { title, description, status, endDate };
-    if (members) updates.members = normalizeMembers(members, req.user.id);
+    const updates = {};
+    if (title !== undefined) updates.title = title;
+    if (description !== undefined) updates.description = description;
+    if (status !== undefined) updates.status = status;
+    if (endDate !== undefined) updates.end_date = endDate || null;
 
-    project = await Project.findByIdAndUpdate(
-      req.params.id,
-      updates,
-      { new: true, runValidators: true }
-    )
-    .populate('members.user', 'name email avatar role jobRole')
-    .populate('createdBy', 'name email avatar');
+    const { data: projectRow, error } = await supabase
+      .from('projects')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (Array.isArray(members)) {
+      const { error: deleteError } = await supabase
+        .from('project_members')
+        .delete()
+        .eq('project_id', req.params.id);
+
+      if (deleteError) throw deleteError;
+
+      if (members.length > 0) {
+        const memberRows = members.map(member => ({
+          project_id: req.params.id,
+          user_id: member.user || member.user_id || member,
+          role: PROJECT_ROLES.includes(member.role) ? member.role : 'member',
+          added_by: req.user.id
+        }));
+
+        const { error: memberError } = await supabase
+          .from('project_members')
+          .insert(memberRows);
+
+        if (memberError) throw memberError;
+      }
+    }
+
+    const project = await hydrateProject(projectRow);
 
     res.json({
       success: true,
@@ -171,15 +252,6 @@ exports.updateProject = async (req, res) => {
 
 exports.deleteProject = async (req, res) => {
   try {
-    const project = await Project.findById(req.params.id);
-
-    if (!project) {
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
-    }
-
     if (req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
@@ -187,8 +259,12 @@ exports.deleteProject = async (req, res) => {
       });
     }
 
-    await Task.deleteMany({ projectId: req.params.id });
-    await project.deleteOne();
+    const { error } = await supabase
+      .from('projects')
+      .delete()
+      .eq('id', req.params.id);
+
+    if (error) throw error;
 
     res.json({
       success: true,
@@ -208,15 +284,6 @@ exports.addMember = async (req, res) => {
   try {
     const { memberId, role = 'member' } = req.body;
 
-    const project = await Project.findById(req.params.id);
-
-    if (!project) {
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
-    }
-
     if (req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
@@ -231,27 +298,41 @@ exports.addMember = async (req, res) => {
       });
     }
 
-    if (project.members.some(member => memberUserId(member) === memberId)) {
-      return res.status(400).json({
+    const { data: existingProject, error: projectError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (projectError) throw projectError;
+    if (!existingProject) {
+      return res.status(404).json({
         success: false,
-        message: 'User is already a member'
+        message: 'Project not found'
       });
     }
 
-    project.members.push({ user: memberId, role, addedBy: req.user.id });
-    await project.save();
+    const { error } = await supabase
+      .from('project_members')
+      .insert([{
+        project_id: req.params.id,
+        user_id: memberId,
+        role,
+        added_by: req.user.id
+      }]);
+
+    if (error) throw error;
 
     await notificationController.createNotification({
       recipient: memberId,
       sender: req.user.id,
       type: 'member_added',
       title: 'Added to Project',
-      message: `You have been added to project "${project.title}"`,
-      projectId: project._id
+      message: `You have been added to project "${existingProject.title}"`,
+      projectId: existingProject.id
     });
 
-    await project.populate('members.user', 'name email avatar role jobRole');
-    await project.populate('createdBy', 'name email avatar');
+    const project = await hydrateProject(existingProject);
 
     res.json({
       success: true,
@@ -271,15 +352,6 @@ exports.removeMember = async (req, res) => {
   try {
     const { memberId } = req.body;
 
-    const project = await Project.findById(req.params.id);
-
-    if (!project) {
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
-    }
-
     if (req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
@@ -287,22 +359,38 @@ exports.removeMember = async (req, res) => {
       });
     }
 
-    project.members = project.members.filter(
-      member => memberUserId(member) !== memberId
-    );
-    await project.save();
+    const { data: existingProject, error: projectError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (projectError) throw projectError;
+    if (!existingProject) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    const { error } = await supabase
+      .from('project_members')
+      .delete()
+      .eq('project_id', req.params.id)
+      .eq('user_id', memberId);
+
+    if (error) throw error;
 
     await notificationController.createNotification({
       recipient: memberId,
       sender: req.user.id,
       type: 'member_removed',
       title: 'Removed from Project',
-      message: `You have been removed from project "${project.title}"`,
-      projectId: project._id
+      message: `You have been removed from project "${existingProject.title}"`,
+      projectId: existingProject.id
     });
 
-    await project.populate('members.user', 'name email avatar role jobRole');
-    await project.populate('createdBy', 'name email avatar');
+    const project = await hydrateProject(existingProject);
 
     res.json({
       success: true,
@@ -337,28 +425,29 @@ exports.updateMemberRole = async (req, res) => {
       });
     }
 
-    const project = await Project.findById(req.params.id);
+    const { data: existingProject, error: projectError } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
 
-    if (!project) {
+    if (projectError) throw projectError;
+    if (!existingProject) {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
       });
     }
 
-    const member = project.members.find(item => memberUserId(item) === memberId);
-    if (!member) {
-      return res.status(404).json({
-        success: false,
-        message: 'Project member not found'
-      });
-    }
+    const { error } = await supabase
+      .from('project_members')
+      .update({ role })
+      .eq('project_id', req.params.id)
+      .eq('user_id', memberId);
 
-    member.role = role;
-    await project.save();
+    if (error) throw error;
 
-    await project.populate('members.user', 'name email avatar role jobRole');
-    await project.populate('createdBy', 'name email avatar');
+    const project = await hydrateProject(existingProject);
 
     res.json({
       success: true,

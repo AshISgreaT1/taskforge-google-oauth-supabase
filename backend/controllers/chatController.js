@@ -1,22 +1,38 @@
-const ProjectChat = require('../models/ProjectChat');
-const Project = require('../models/Project');
+const { supabase } = require('../config/supabase');
 const notificationController = require('./notificationController');
+const { hydrateProject, getUsersByIds } = require('../services/repository');
+const { toCamelUser } = require('../services/formatters');
 
-const hasProjectAccess = (project, user) => {
-  const isOwner = project.createdBy.toString() === user.id;
-  const isAdmin = user.role === 'admin';
-  const isMember = project.members.some(
-    m => (m.user?._id || m.user || m).toString() === user.id
-  );
+async function hasProjectAccess(project, user) {
+  if (user.role === 'admin') return true;
+  if (project.createdBy?._id === user.id) return true;
+  return (project.members || []).some(member => (member.user?._id || member.user || member).toString() === user.id);
+}
 
-  return isOwner || isAdmin || isMember;
-};
+async function getProject(projectId) {
+  const { data, error } = await supabase.from('projects').select('*').eq('id', projectId).maybeSingle();
+  if (error) throw error;
+  return data ? hydrateProject(data) : null;
+}
+
+async function hydrateMessage(row) {
+  const users = await getUsersByIds([row.sender_id]);
+  return {
+    _id: row.id,
+    id: row.id,
+    sender: toCamelUser(users[0]),
+    content: row.content,
+    messageType: row.message_type,
+    mediaUrl: row.media_url,
+    createdAt: row.created_at
+  };
+}
 
 exports.getProjectChat = async (req, res) => {
   try {
     const { projectId } = req.params;
+    const project = await getProject(projectId);
 
-    const project = await Project.findById(projectId);
     if (!project) {
       return res.status(404).json({
         success: false,
@@ -24,28 +40,19 @@ exports.getProjectChat = async (req, res) => {
       });
     }
 
-    if (!hasProjectAccess(project, req.user)) {
+    if (!(await hasProjectAccess(project, req.user))) {
       return res.status(403).json({
         success: false,
         message: 'You are not a member of this project'
       });
     }
 
-    let chat = await ProjectChat.findOne({ projectId })
-      .populate('participants', 'name avatar jobRole')
-      .populate('messages.sender', 'name avatar');
-
-    if (!chat) {
-      chat = await ProjectChat.create({
-        projectId,
-        participants: [req.user.id],
-        messages: []
-      });
-    }
-
     res.json({
       success: true,
-      chat
+      chat: {
+        projectId,
+        participants: [req.user.id]
+      }
     });
   } catch (error) {
     console.error('Get project chat error:', error);
@@ -68,7 +75,7 @@ exports.sendMessage = async (req, res) => {
       });
     }
 
-    const project = await Project.findById(projectId);
+    const project = await getProject(projectId);
     if (!project) {
       return res.status(404).json({
         success: false,
@@ -76,44 +83,36 @@ exports.sendMessage = async (req, res) => {
       });
     }
 
-    if (!hasProjectAccess(project, req.user)) {
+    if (!(await hasProjectAccess(project, req.user))) {
       return res.status(403).json({
         success: false,
         message: 'You are not a member of this project'
       });
     }
 
-    let chat = await ProjectChat.findOne({ projectId });
+    const { data, error } = await supabase
+      .from('chat_messages')
+      .insert([{
+        project_id: projectId,
+        sender_id: req.user.id,
+        content: content || mediaUrl || '',
+        message_type: messageType || 'text',
+        media_url: mediaUrl || null
+      }])
+      .select('*')
+      .single();
 
-    if (!chat) {
-      chat = await ProjectChat.create({
-        projectId,
-        participants: [req.user.id],
-        messages: []
-      });
-    }
+    if (error) throw error;
 
-    const message = {
-      sender: req.user.id,
-      content,
-      messageType: messageType || 'text',
-      mediaUrl
-    };
+    const message = await hydrateMessage(data);
 
-    chat.messages.push(message);
-    chat.lastMessage = message;
-    chat.lastActivity = Date.now();
+    const participantIds = new Set([
+      project.createdBy._id,
+      ...(project.members || []).map(member => (member.user?._id || member.user || member).toString())
+    ]);
 
-    await chat.save();
-    await chat.populate('messages.sender', 'name avatar');
-
-    const participantIds = [
-      project.createdBy.toString(),
-      ...project.members.map(m => (m.user?._id || m.user || m).toString())
-    ];
-    const otherParticipants = participantIds.filter(id => id !== req.user.id);
-
-    for (const recipientId of otherParticipants) {
+    for (const recipientId of participantIds) {
+      if (recipientId === req.user.id) continue;
       await notificationController.createNotification({
         recipient: recipientId,
         sender: req.user.id,
@@ -126,7 +125,7 @@ exports.sendMessage = async (req, res) => {
 
     res.json({
       success: true,
-      message: chat.messages[chat.messages.length - 1]
+      message
     });
   } catch (error) {
     console.error('Send message error:', error);
@@ -141,8 +140,8 @@ exports.getMessages = async (req, res) => {
   try {
     const { projectId } = req.params;
     const { limit = 50, before } = req.query;
+    const project = await getProject(projectId);
 
-    const project = await Project.findById(projectId);
     if (!project) {
       return res.status(404).json({
         success: false,
@@ -150,30 +149,31 @@ exports.getMessages = async (req, res) => {
       });
     }
 
-    if (!hasProjectAccess(project, req.user)) {
+    if (!(await hasProjectAccess(project, req.user))) {
       return res.status(403).json({
         success: false,
         message: 'You are not a member of this project'
       });
     }
 
-    const chat = await ProjectChat.findOne({ projectId })
-      .populate('messages.sender', 'name avatar');
+    let query = supabase
+      .from('chat_messages')
+      .select('*')
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: true })
+      .limit(parseInt(limit, 10));
 
-    if (!chat) {
-      return res.json({
-        success: true,
-        messages: []
-      });
-    }
-
-    let messages = chat.messages;
     if (before) {
-      const beforeDate = new Date(before);
-      messages = messages.filter(m => m.createdAt < beforeDate);
+      query = query.lt('created_at', before);
     }
 
-    messages = messages.slice(-parseInt(limit));
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const messages = [];
+    for (const row of data || []) {
+      messages.push(await hydrateMessage(row));
+    }
 
     res.json({
       success: true,
@@ -191,9 +191,9 @@ exports.getMessages = async (req, res) => {
 exports.addParticipant = async (req, res) => {
   try {
     const { projectId } = req.params;
-    const { userId, role } = req.body;
+    const { userId } = req.body;
 
-    const project = await Project.findById(projectId);
+    const project = await getProject(projectId);
     if (!project) {
       return res.status(404).json({
         success: false,
@@ -208,29 +208,13 @@ exports.addParticipant = async (req, res) => {
       });
     }
 
-    let chat = await ProjectChat.findOne({ projectId });
-
-    if (!chat) {
-      chat = await ProjectChat.create({
-        projectId,
-        participants: [],
-        messages: []
-      });
-    }
-
-    const isProjectMember = project.createdBy.toString() === userId ||
-      project.members.some(m => (m.user?._id || m.user || m).toString() === userId);
-
-    if (!isProjectMember) {
+    const member = (project.members || []).some(m => (m.user?._id || m.user || m).toString() === userId);
+    const owner = project.createdBy?._id === userId;
+    if (!member && !owner) {
       return res.status(403).json({
         success: false,
         message: 'Only project members can be added to project chat'
       });
-    }
-
-    if (!chat.participants.includes(userId)) {
-      chat.participants.push(userId);
-      await chat.save();
     }
 
     await notificationController.createNotification({
@@ -258,8 +242,7 @@ exports.addParticipant = async (req, res) => {
 exports.removeParticipant = async (req, res) => {
   try {
     const { projectId, userId } = req.params;
-
-    const project = await Project.findById(projectId);
+    const project = await getProject(projectId);
     if (!project) {
       return res.status(404).json({
         success: false,
@@ -272,15 +255,6 @@ exports.removeParticipant = async (req, res) => {
         success: false,
         message: 'Only admins can remove members'
       });
-    }
-
-    let chat = await ProjectChat.findOne({ projectId });
-
-    if (chat) {
-      chat.participants = chat.participants.filter(
-        p => p.toString() !== userId
-      );
-      await chat.save();
     }
 
     await notificationController.createNotification({

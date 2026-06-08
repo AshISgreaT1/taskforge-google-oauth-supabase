@@ -1,30 +1,64 @@
-const Comment = require('../models/Comment');
-const Task = require('../models/Task');
-const Project = require('../models/Project');
-const ActivityLog = require('../models/ActivityLog');
+const { supabase } = require('../config/supabase');
+const { hydrateTask, getUsersByIds } = require('../services/repository');
+const { toCamelUser } = require('../services/formatters');
 
-const canAccessTask = async (task, user) => {
+async function canAccessTask(task, user) {
   if (user.role === 'admin') return true;
+  const projectId = task.projectId?._id || task.projectId;
+  if (!projectId) return false;
 
-  const project = await Project.findById(task.projectId).select('createdBy members');
-  if (!project) return false;
+  const { data: projectRow, error } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('id', projectId)
+    .maybeSingle();
 
-  return project.createdBy.toString() === user.id ||
-    project.members.some(member => (member.user?._id || member.user || member).toString() === user.id);
-};
+  if (error || !projectRow) return false;
+  if (projectRow.created_by === user.id) return true;
+
+  const { data: memberRows, error: memberError } = await supabase
+    .from('project_members')
+    .select('id')
+    .eq('project_id', projectId)
+    .eq('user_id', user.id);
+
+  if (memberError) return false;
+  return (memberRows || []).length > 0;
+}
+
+async function hydrateComment(row) {
+  const users = row.author_id ? await getUsersByIds([row.author_id]) : [];
+  const mentions = Array.isArray(row.mentions) && row.mentions.length
+    ? await getUsersByIds(row.mentions)
+    : [];
+
+  return {
+    _id: row.id,
+    id: row.id,
+    content: row.content,
+    taskId: row.task_id,
+    author: toCamelUser(users[0]),
+    mentions: mentions.map(toCamelUser),
+    isEdited: row.is_edited,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
 
 exports.getComments = async (req, res) => {
   try {
     const { taskId } = req.params;
+    const { data: taskRow, error } = await supabase.from('tasks').select('*').eq('id', taskId).maybeSingle();
 
-    const task = await Task.findById(taskId);
-    if (!task) {
+    if (error) throw error;
+    if (!taskRow) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
+    const task = await hydrateTask(taskRow);
     if (!(await canAccessTask(task, req.user))) {
       return res.status(403).json({
         success: false,
@@ -32,10 +66,18 @@ exports.getComments = async (req, res) => {
       });
     }
 
-    const comments = await Comment.find({ taskId })
-      .populate('author', 'name email avatar')
-      .populate('mentions', 'name email avatar')
-      .sort({ createdAt: -1 });
+    const { data, error: commentsError } = await supabase
+      .from('comments')
+      .select('*')
+      .eq('task_id', taskId)
+      .order('created_at', { ascending: false });
+
+    if (commentsError) throw commentsError;
+
+    const comments = [];
+    for (const row of data || []) {
+      comments.push(await hydrateComment(row));
+    }
 
     res.json({
       success: true,
@@ -54,16 +96,18 @@ exports.getComments = async (req, res) => {
 exports.createComment = async (req, res) => {
   try {
     const { taskId } = req.params;
-    const { content, mentions } = req.body;
+    const { content, mentions = [] } = req.body;
 
-    const task = await Task.findById(taskId);
-    if (!task) {
+    const { data: taskRow, error } = await supabase.from('tasks').select('*').eq('id', taskId).maybeSingle();
+    if (error) throw error;
+    if (!taskRow) {
       return res.status(404).json({
         success: false,
         message: 'Task not found'
       });
     }
 
+    const task = await hydrateTask(taskRow);
     if (!(await canAccessTask(task, req.user))) {
       return res.status(403).json({
         success: false,
@@ -71,25 +115,20 @@ exports.createComment = async (req, res) => {
       });
     }
 
-    const comment = await Comment.create({
-      content,
-      taskId,
-      author: req.user.id,
-      mentions: mentions || []
-    });
+    const { data, error: insertError } = await supabase
+      .from('comments')
+      .insert([{
+        task_id: taskId,
+        author_id: req.user.id,
+        content,
+        mentions
+      }])
+      .select('*')
+      .single();
 
-    await comment.populate('author', 'name email avatar');
-    await comment.populate('mentions', 'name email avatar');
+    if (insertError) throw insertError;
 
-    await ActivityLog.create({
-      user: req.user.id,
-      action: 'comment_added',
-      entityType: 'comment',
-      entityId: comment._id,
-      details: { taskId, content: content.substring(0, 100) },
-      ipAddress: req.ip,
-      userAgent: req.headers['user-agent']
-    });
+    const comment = await hydrateComment(data);
 
     res.status(201).json({
       success: true,
@@ -110,40 +149,34 @@ exports.updateComment = async (req, res) => {
     const { id } = req.params;
     const { content } = req.body;
 
-    const comment = await Comment.findById(id);
-
-    if (!comment) {
+    const { data: commentRow, error } = await supabase.from('comments').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!commentRow) {
       return res.status(404).json({
         success: false,
         message: 'Comment not found'
       });
     }
 
-    if (comment.author.toString() !== req.user.id && req.user.role !== 'admin') {
+    if (commentRow.author_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to update this comment'
       });
     }
 
-    const task = await Task.findById(comment.taskId);
-    if (!task || !(await canAccessTask(task, req.user))) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to update this comment'
-      });
-    }
+    const { data, error: updateError } = await supabase
+      .from('comments')
+      .update({ content, is_edited: true })
+      .eq('id', id)
+      .select('*')
+      .single();
 
-    comment.content = content;
-    comment.isEdited = true;
-    await comment.save();
-
-    await comment.populate('author', 'name email avatar');
-    await comment.populate('mentions', 'name email avatar');
+    if (updateError) throw updateError;
 
     res.json({
       success: true,
-      comment
+      comment: await hydrateComment(data)
     });
   } catch (error) {
     console.error(error);
@@ -159,31 +192,28 @@ exports.deleteComment = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const comment = await Comment.findById(id);
-
-    if (!comment) {
+    const { data: commentRow, error } = await supabase.from('comments').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    if (!commentRow) {
       return res.status(404).json({
         success: false,
         message: 'Comment not found'
       });
     }
 
-    if (comment.author.toString() !== req.user.id && req.user.role !== 'admin') {
+    if (commentRow.author_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to delete this comment'
       });
     }
 
-    const task = await Task.findById(comment.taskId);
-    if (!task || !(await canAccessTask(task, req.user))) {
-      return res.status(403).json({
-        success: false,
-        message: 'Not authorized to delete this comment'
-      });
-    }
+    const { error: deleteError } = await supabase
+      .from('comments')
+      .delete()
+      .eq('id', id);
 
-    await comment.deleteOne();
+    if (deleteError) throw deleteError;
 
     res.json({
       success: true,

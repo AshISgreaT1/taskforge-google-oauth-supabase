@@ -1,12 +1,27 @@
-const ActivityLog = require('../models/ActivityLog');
-const Project = require('../models/Project');
-const Task = require('../models/Task');
+const { supabase } = require('../config/supabase');
+const { getProjectMembers, getUsersByIds, hydrateTasks } = require('../services/repository');
+const { toCamelActivity } = require('../services/formatters');
 
-const hasProjectAccess = (project, user) => {
-  if (user.role === 'admin') return true;
-  return project.createdBy.toString() === user.id ||
-    project.members.some(member => (member.user?._id || member.user || member).toString() === user.id);
-};
+async function getAccessibleProjectIds(user) {
+  if (user.role === 'admin') {
+    const { data, error } = await supabase.from('projects').select('id');
+    if (error) throw error;
+    return (data || []).map(project => project.id);
+  }
+
+  const [owned, memberships] = await Promise.all([
+    supabase.from('projects').select('id').eq('created_by', user.id),
+    supabase.from('project_members').select('project_id').eq('user_id', user.id)
+  ]);
+
+  if (owned.error) throw owned.error;
+  if (memberships.error) throw memberships.error;
+
+  return [
+    ...(owned.data || []).map(project => project.id),
+    ...(memberships.data || []).map(member => member.project_id)
+  ];
+}
 
 exports.getActivityLogs = async (req, res) => {
   try {
@@ -19,19 +34,19 @@ exports.getActivityLogs = async (req, res) => {
 
     const { entityType, entityId, userId, limit = 50 } = req.query;
 
-    const filter = {};
-    if (entityType && entityId) {
-      filter.entityType = entityType;
-      filter.entityId = entityId;
-    }
-    if (userId) {
-      filter.user = userId;
-    }
+    let query = supabase.from('task_activity').select('*').order('created_at', { ascending: false }).limit(parseInt(limit, 10));
+    if (entityType === 'task' && entityId) query = query.eq('task_id', entityId);
+    if (userId) query = query.eq('user_id', userId);
 
-    const logs = await ActivityLog.find(filter)
-      .populate('user', 'name email avatar')
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const userIds = [...new Set((data || []).map(item => item.user_id).filter(Boolean))];
+    const usersRes = userIds.length ? await supabase.from('users').select('*').in('id', userIds) : { data: [] };
+    if (usersRes.error) throw usersRes.error;
+
+    const userMap = new Map((usersRes.data || []).map(user => [user.id, user]));
+    const logs = (data || []).map(item => toCamelActivity(item, userMap.get(item.user_id)));
 
     res.json({
       success: true,
@@ -52,33 +67,41 @@ exports.getProjectActivity = async (req, res) => {
     const { projectId } = req.params;
     const { limit = 50 } = req.query;
 
-    const project = await Project.findById(projectId);
-    if (!project) {
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
-    }
-
-    if (!hasProjectAccess(project, req.user)) {
+    const accessible = await getAccessibleProjectIds(req.user);
+    if (req.user.role !== 'admin' && !accessible.includes(projectId)) {
       return res.status(403).json({
         success: false,
         message: 'Not authorized to access this project activity'
       });
     }
 
-    const tasks = await Task.find({ projectId }).select('_id');
-    const taskIds = tasks.map(t => t._id);
+    const { data: taskRows, error } = await supabase
+      .from('tasks')
+      .select('id')
+      .eq('project_id', projectId);
 
-    const logs = await ActivityLog.find({
-      $or: [
-        { entityType: 'project', entityId: projectId },
-        { entityType: 'task', entityId: { $in: taskIds } }
-      ]
-    })
-      .populate('user', 'name email avatar')
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
+    if (error) throw error;
+
+    const taskIds = (taskRows || []).map(task => task.id);
+    if (taskIds.length === 0) {
+      return res.json({ success: true, logs: [] });
+    }
+
+    const { data: activityRows, error: activityError } = await supabase
+      .from('task_activity')
+      .select('*')
+      .in('task_id', taskIds)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit, 10));
+
+    if (activityError) throw activityError;
+
+    const userIds = [...new Set((activityRows || []).map(item => item.user_id).filter(Boolean))];
+    const usersRes = userIds.length ? await supabase.from('users').select('*').in('id', userIds) : { data: [] };
+    if (usersRes.error) throw usersRes.error;
+
+    const userMap = new Map((usersRes.data || []).map(user => [user.id, user]));
+    const logs = (activityRows || []).map(item => toCamelActivity(item, userMap.get(item.user_id)));
 
     res.json({
       success: true,
@@ -98,19 +121,21 @@ exports.getAuditLogs = async (req, res) => {
   try {
     const { startDate, endDate, userId, action, limit = 100 } = req.query;
 
-    const filter = {};
-    if (startDate || endDate) {
-      filter.createdAt = {};
-      if (startDate) filter.createdAt.$gte = new Date(startDate);
-      if (endDate) filter.createdAt.$lte = new Date(endDate);
-    }
-    if (userId) filter.user = userId;
-    if (action) filter.action = action;
+    let query = supabase.from('task_activity').select('*').order('created_at', { ascending: false }).limit(parseInt(limit, 10));
+    if (startDate) query = query.gte('created_at', startDate);
+    if (endDate) query = query.lte('created_at', endDate);
+    if (userId) query = query.eq('user_id', userId);
+    if (action) query = query.eq('action', action);
 
-    const logs = await ActivityLog.find(filter)
-      .populate('user', 'name email avatar')
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit));
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const userIds = [...new Set((data || []).map(item => item.user_id).filter(Boolean))];
+    const usersRes = userIds.length ? await supabase.from('users').select('*').in('id', userIds) : { data: [] };
+    if (usersRes.error) throw usersRes.error;
+    const userMap = new Map((usersRes.data || []).map(user => [user.id, user]));
+
+    const logs = (data || []).map(item => toCamelActivity(item, userMap.get(item.user_id)));
 
     res.json({
       success: true,
@@ -132,29 +157,21 @@ exports.getActivityStats = async (req, res) => {
     const { projectId, days = 7 } = req.query;
 
     const startDate = new Date();
-    startDate.setDate(startDate.getDate() - parseInt(days));
+    startDate.setDate(startDate.getDate() - parseInt(days, 10));
 
-    let filter = { createdAt: { $gte: startDate } };
-
+    let taskIds = null;
     if (projectId) {
-      const project = await Project.findById(projectId);
-      if (!project) {
-        return res.status(404).json({ success: false, message: 'Project not found' });
-      }
-
-      if (!hasProjectAccess(project, req.user)) {
+      const accessible = await getAccessibleProjectIds(req.user);
+      if (req.user.role !== 'admin' && !accessible.includes(projectId)) {
         return res.status(403).json({
           success: false,
           message: 'Not authorized to access this project activity'
         });
       }
 
-      const tasks = await Task.find({ projectId }).select('_id');
-      const taskIds = tasks.map(t => t._id);
-      filter.$or = [
-        { entityType: 'project', entityId: projectId },
-        { entityType: 'task', entityId: { $in: taskIds } }
-      ];
+      const { data, error } = await supabase.from('tasks').select('id').eq('project_id', projectId);
+      if (error) throw error;
+      taskIds = (data || []).map(task => task.id);
     } else if (req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
@@ -162,40 +179,30 @@ exports.getActivityStats = async (req, res) => {
       });
     }
 
-    const stats = await ActivityLog.aggregate([
-      { $match: filter },
-      {
-        $group: {
-          _id: {
-            action: '$action',
-            date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }
-          },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { '_id.date': -1 } }
-    ]);
+    let query = supabase
+      .from('task_activity')
+      .select('*')
+      .gte('created_at', startDate.toISOString());
+    if (taskIds) query = query.in('task_id', taskIds);
 
-    const activityByDate = {};
-    const activityByAction = {};
+    const { data, error } = await query;
+    if (error) throw error;
 
-    stats.forEach(s => {
-      const date = s._id.date;
-      const action = s._id.action;
+    const byDate = {};
+    const byAction = {};
 
-      if (!activityByDate[date]) activityByDate[date] = 0;
-      activityByDate[date] += s.count;
-
-      if (!activityByAction[action]) activityByAction[action] = 0;
-      activityByAction[action] += s.count;
+    (data || []).forEach(item => {
+      const date = item.created_at.slice(0, 10);
+      byDate[date] = (byDate[date] || 0) + 1;
+      byAction[item.action] = (byAction[item.action] || 0) + 1;
     });
 
     res.json({
       success: true,
       stats: {
-        byDate: activityByDate,
-        byAction: activityByAction,
-        total: stats.reduce((sum, s) => sum + s.count, 0)
+        byDate,
+        byAction,
+        total: (data || []).length
       }
     });
   } catch (error) {
