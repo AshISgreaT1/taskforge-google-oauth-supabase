@@ -40,17 +40,22 @@ export default function Login() {
   const buttonRef = useRef(null);
   const { googleLogin } = useAuth();
   const navigate = useNavigate();
+  const hasGoogleClientId = Boolean(import.meta.env.VITE_GOOGLE_CLIENT_ID);
 
   useEffect(() => {
     let mounted = true;
 
     const init = async () => {
       try {
+        if (!import.meta.env.VITE_GOOGLE_CLIENT_ID) {
+          setError('Google OAuth client ID is not configured for local development.');
+          return;
+        }
         await loadGoogleScript();
         if (!mounted || !window.google?.accounts?.id || !buttonRef.current) return;
 
         window.google.accounts.id.initialize({
-          client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
+            client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
           callback: async (response) => {
             try {
               setLoading(true);
@@ -144,13 +149,19 @@ export default function Login() {
               <button
                 type="button"
                 onClick={() => window.google?.accounts?.id?.prompt()}
-                disabled={loading}
+                disabled={loading || !hasGoogleClientId}
                 className="w-full rounded-full bg-white text-slate-950 font-semibold px-4 py-3 hover:bg-slate-100 transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
               >
                 {loading && <Loader2 className="w-4 h-4 animate-spin" />}
                 Continue with Google
               </button>
             </div>
+
+            {!hasGoogleClientId && (
+              <p className="mt-3 text-sm text-amber-300">
+                Add `VITE_GOOGLE_CLIENT_ID` in `frontend/.env` to enable Google sign-in locally.
+              </p>
+            )}
 
             <p className="mt-6 text-sm text-slate-400">
               By continuing, you agree to the platform terms and team workspace access policies.

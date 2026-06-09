@@ -62,7 +62,7 @@ Copy `.env.example` to your local `.env` files and fill in the values.
 
 ### 3. Apply Supabase schema
 
-Run the SQL in `backend/supabase/migrations/001_init.sql` in the Supabase SQL editor.
+Run `backend/supabase/migrations/001_init.sql` first, then `backend/supabase/migrations/002_add_missing_tables.sql` if your Supabase project was only partially initialized.
 
 ### 4. Start locally
 

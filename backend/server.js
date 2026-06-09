@@ -2,9 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
-const authRoutes = require('./routes/authRoutes');
 
 dotenv.config();
+
+const authRoutes = require('./routes/authRoutes');
 
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
