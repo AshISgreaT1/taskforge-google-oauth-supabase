@@ -88,7 +88,7 @@ export default function Projects() {
       title: project.title,
       description: project.description || '',
       endDate: project.endDate ? new Date(project.endDate).toISOString().split('T')[0] : '',
-      members: project.members.map(m => m.user?._id || m._id)
+      members: project.members.map(m => m.user?._id).filter(Boolean)
     });
     setShowModal(true);
   };
