@@ -338,20 +338,6 @@ exports.createTask = async (req, res) => {
     }
 
     const { data: taskRow, error: taskError } = await supabase
-      .from('projects')
-      .select('*')
-      .eq('id', projectId)
-      .maybeSingle();
-
-    if (projectError) throw projectError;
-    if (!projectRow) {
-      return res.status(404).json({
-        success: false,
-        message: 'Project not found'
-      });
-    }
-
-    const { data: taskRow, error: taskError } = await supabase
       .from('tasks')
       .insert([{
         title,
