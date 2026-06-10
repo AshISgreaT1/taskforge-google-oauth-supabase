@@ -99,6 +99,7 @@ export default function ProjectDetail() {
     setSubmitting(true);
 
     try {
+      console.log('Submitting task with assignedTo:', formData.assignedTo);
       await taskAPI.createTask({
         ...formData,
         projectId: id
@@ -436,13 +437,20 @@ export default function ProjectDetail() {
                       <label className="block text-sm font-medium mb-2">Assign To</label>
                       <select
                         value={formData.assignedTo}
-                        onChange={(e) => setFormData({ ...formData, assignedTo: e.target.value })}
+                        onChange={(e) => {
+                          const selectedUser = users.find(u => u.id === e.target.value);
+                          console.log('Selected assignee object:', selectedUser);
+                          console.log('Selected assignee id:', selectedUser?.id);
+                          console.log('Selected assignee _id:', selectedUser?._id);
+                          setFormData({ ...formData, assignedTo: e.target.value });
+                        }}
                         className="input-field"
                       >
                         <option value="">Unassigned</option>
-                        {users.map((u) => (
-                          <option key={u._id} value={u._id}>{u.name}</option>
-                        ))}
+                        {users.map((u) => {
+                          console.log('TASK USER OBJECT:', u);
+                          return <option key={u.id} value={u.id}>{u.name}</option>;
+                        })}
                       </select>
                     </div>
 
