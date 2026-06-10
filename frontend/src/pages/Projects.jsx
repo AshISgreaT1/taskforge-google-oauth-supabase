@@ -56,8 +56,12 @@ export default function Projects() {
 
     try {
       if (editingProject) {
+        console.log('UPDATE - formData.members:', JSON.stringify(formData.members));
+        console.log('UPDATE - members value:', formData.members);
         await projectAPI.updateProject(editingProject._id, formData);
       } else {
+        console.log('selectedMembers', formData.members);
+        console.log('payload members', formData.members);
         await projectAPI.createProject(formData);
       }
       setShowModal(false);
