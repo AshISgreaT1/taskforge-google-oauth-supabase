@@ -245,7 +245,7 @@ exports.updateProject = async (req, res) => {
         const memberRows = members.map(member => ({
           project_id: req.params.id,
           user_id: member?.user || member?.user_id || member,
-          role: PROJECT_ROLES.includes(member.role) ? member.role : 'member',
+          role: PROJECT_ROLES.includes(member?.role) ? member?.role : 'member',
           added_by: req.user.id
         }));
 
