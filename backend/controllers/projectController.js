@@ -14,6 +14,21 @@ function memberUserId(member) {
   return (member.user?._id || member.user || member._id || member).toString();
 }
 
+async function getProjectRow(projectId) {
+  const { data, error } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('id', projectId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+function canManageProject(user, projectRow) {
+  return user.role === 'admin' || projectRow?.created_by === user.id;
+}
+
 async function getAccessibleProjectIds(user) {
   if (user.role === 'admin') {
     const { data, error } = await supabase.from('projects').select('id');
@@ -182,10 +197,18 @@ exports.updateProject = async (req, res) => {
   try {
     const { title, description, members, status, endDate } = req.body;
 
-    if (req.user.role !== 'admin') {
+    const projectRow = await getProjectRow(req.params.id);
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (!canManageProject(req.user, projectRow)) {
       return res.status(403).json({
         success: false,
-        message: 'Only admins can update projects'
+        message: 'Only project owners or admins can update projects'
       });
     }
 
@@ -252,10 +275,18 @@ exports.updateProject = async (req, res) => {
 
 exports.deleteProject = async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
+    const projectRow = await getProjectRow(req.params.id);
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (!canManageProject(req.user, projectRow)) {
       return res.status(403).json({
         success: false,
-        message: 'Only admins can delete projects'
+        message: 'Only project owners or admins can delete projects'
       });
     }
 
@@ -284,10 +315,18 @@ exports.addMember = async (req, res) => {
   try {
     const { memberId, role = 'member' } = req.body;
 
-    if (req.user.role !== 'admin') {
+    const projectRow = await getProjectRow(req.params.id);
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (!canManageProject(req.user, projectRow)) {
       return res.status(403).json({
         success: false,
-        message: 'Only admins can add members'
+        message: 'Only project owners or admins can add members'
       });
     }
 
@@ -352,10 +391,18 @@ exports.removeMember = async (req, res) => {
   try {
     const { memberId } = req.body;
 
-    if (req.user.role !== 'admin') {
+    const projectRow = await getProjectRow(req.params.id);
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (!canManageProject(req.user, projectRow)) {
       return res.status(403).json({
         success: false,
-        message: 'Only admins can remove members'
+        message: 'Only project owners or admins can remove members'
       });
     }
 
@@ -411,10 +458,18 @@ exports.updateMemberRole = async (req, res) => {
     const { memberId } = req.params;
     const { role } = req.body;
 
-    if (req.user.role !== 'admin') {
+    const projectRow = await getProjectRow(req.params.id);
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (!canManageProject(req.user, projectRow)) {
       return res.status(403).json({
         success: false,
-        message: 'Only admins can change member roles'
+        message: 'Only project owners or admins can change member roles'
       });
     }
 

@@ -198,7 +198,7 @@ export default function Projects() {
                 </div>
               </Link>
 
-              {isAdmin && (
+              {(project.createdBy._id === user?.id || isAdmin) && (
               <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
                 <div className="flex items-center gap-1 bg-dark-800 rounded-lg p-1">
                   <button

@@ -56,6 +56,7 @@ export default function ProjectDetail() {
   const [viewMode, setViewMode] = useState('kanban');
   const { user } = useAuth();
   const isAdmin = user?.role === 'admin';
+  const canManageProject = isAdmin || project?.createdBy?._id === user?.id;
 
   useEffect(() => {
     fetchProject();
@@ -201,7 +202,7 @@ export default function ProjectDetail() {
           </div>
           <p className="text-dark-400">{project?.description || 'No description'}</p>
         </div>
-        {isAdmin && (
+        {canManageProject && (
           <button
             onClick={() => setShowTaskModal(true)}
             className="btn-primary flex items-center gap-2"
@@ -318,7 +319,7 @@ export default function ProjectDetail() {
           <div className="card">
             <div className="flex items-center justify-between mb-4">
               <h3 className="font-semibold">Team Members</h3>
-              {isAdmin && (
+              {canManageProject && (
                 <button
                   onClick={() => setShowMemberModal(true)}
                   className="p-2 hover:bg-dark-700 rounded-lg transition-colors"
@@ -350,7 +351,7 @@ export default function ProjectDetail() {
                   />
                   <div className="flex-1 min-w-0">
                     <p className="font-medium text-sm truncate">{memberUser.name}</p>
-                    {isAdmin ? (
+                    {canManageProject ? (
                       <select
                         value={member.role || memberUser.jobRole || 'member'}
                         onChange={(e) => handleMemberRoleChange(memberUser._id, e.target.value)}
@@ -364,7 +365,7 @@ export default function ProjectDetail() {
                       <p className="text-xs text-dark-400">{member.role || memberUser.email}</p>
                     )}
                   </div>
-                  {isAdmin && (
+                  {canManageProject && (
                     <button
                       onClick={() => handleRemoveMember(memberUser._id)}
                       className="p-1 hover:bg-red-600/20 text-red-400 rounded transition-colors"

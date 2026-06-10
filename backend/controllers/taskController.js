@@ -145,6 +145,21 @@ async function getAccessibleProjectIds(user) {
   ];
 }
 
+async function getProjectRow(projectId) {
+  const { data, error } = await supabase
+    .from('projects')
+    .select('*')
+    .eq('id', projectId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+function canManageProject(user, projectRow) {
+  return user.role === 'admin' || projectRow?.created_by === user.id;
+}
+
 async function fetchTasksForProject(projectId) {
   const rows = await getTasksByFilter({ projectId });
   return hydrateTasks(rows);
@@ -178,8 +193,9 @@ function getAllowedNextStatuses(task, user) {
   const isAdmin = user.role === 'admin';
   const isAssigned = task.assignedTo?._id === user.id;
   const isCreator = task.createdBy?._id === user.id;
+  const isProjectOwner = task.projectId?.createdBy?._id === user.id;
 
-  if (!isAdmin && !isAssigned && !isCreator) return [];
+  if (!isAdmin && !isAssigned && !isCreator && !isProjectOwner) return [];
   if (task.status === 'todo') return ['in-progress'];
   if (task.status === 'in-progress') return ['pending-approval', 'completed'];
   if (task.status === 'pending-approval') return ['pending-approval', 'completed', 'in-progress'];
@@ -306,14 +322,22 @@ exports.createTask = async (req, res) => {
   try {
     const { title, description, assignedTo, priority, dueDate, projectId, generateSubtasks: generateAI } = req.body;
 
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
+    const projectRow = await getProjectRow(projectId);
+    if (!projectRow) {
+      return res.status(404).json({
         success: false,
-        message: 'Only admins can create and assign tasks'
+        message: 'Project not found'
       });
     }
 
-    const { data: projectRow, error: projectError } = await supabase
+    if (!canManageProject(req.user, projectRow)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only project owners or admins can create tasks'
+      });
+    }
+
+    const { data: taskRow, error: taskError } = await supabase
       .from('projects')
       .select('*')
       .eq('id', projectId)
@@ -420,10 +444,18 @@ exports.updateTask = async (req, res) => {
       });
     }
 
-    if (req.user.role !== 'admin') {
+    const projectRow = await getProjectRow(taskRow.project_id);
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (!canManageProject(req.user, projectRow)) {
       return res.status(403).json({
         success: false,
-        message: 'Only admins can edit tasks'
+        message: 'Only project owners or admins can edit tasks'
       });
     }
 
@@ -588,18 +620,34 @@ exports.updateTaskStatus = async (req, res) => {
 
 exports.deleteTask = async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Only admins can delete tasks'
-      });
-    }
-
     const { data: taskRow, error: taskError } = await supabase
       .from('tasks')
       .select('*')
       .eq('id', req.params.id)
       .maybeSingle();
+
+    if (taskError) throw taskError;
+    if (!taskRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Task not found'
+      });
+    }
+
+    const projectRow = await getProjectRow(taskRow.project_id);
+    if (!projectRow) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found'
+      });
+    }
+
+    if (!canManageProject(req.user, projectRow)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only project owners or admins can delete tasks'
+      });
+    }
 
     if (taskError) throw taskError;
     if (!taskRow) {
