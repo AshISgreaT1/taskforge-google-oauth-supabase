@@ -218,7 +218,7 @@ exports.updateProject = async (req, res) => {
     if (status !== undefined) updates.status = status;
     if (endDate !== undefined) updates.end_date = endDate || null;
 
-    const { data: projectRow, error } = await supabase
+    const { data: updatedProjectRow, error } = await supabase
       .from('projects')
       .update(updates)
       .eq('id', req.params.id)
@@ -226,7 +226,7 @@ exports.updateProject = async (req, res) => {
       .maybeSingle();
 
     if (error) throw error;
-    if (!projectRow) {
+    if (!updatedProjectRow) {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
@@ -257,7 +257,7 @@ exports.updateProject = async (req, res) => {
       }
     }
 
-    const project = await hydrateProject(projectRow);
+    const project = await hydrateProject(updatedProjectRow);
 
     res.json({
       success: true,
