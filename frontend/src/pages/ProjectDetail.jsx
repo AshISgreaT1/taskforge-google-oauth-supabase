@@ -341,7 +341,8 @@ export default function ProjectDetail() {
                 </div>
               </div>
               {project?.members?.map((member) => {
-                const memberUser = member.user || member;
+                const memberUser = member.user;
+                if (!memberUser || !memberUser._id) return null;
                 return (
                 <div key={memberUser._id} className="flex items-center gap-3 p-2 bg-dark-700/50 rounded-lg">
                   <img
