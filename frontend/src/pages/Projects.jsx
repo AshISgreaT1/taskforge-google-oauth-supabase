@@ -88,6 +88,8 @@ export default function Projects() {
 
   const openEditModal = (project) => {
     setEditingProject(project);
+    console.log('openEditModal - project.members:', project.members);
+    console.log('openEditModal - mapped ids:', project.members.map(m => m.user?._id));
     setFormData({
       title: project.title,
       description: project.description || '',
@@ -307,6 +309,9 @@ export default function Projects() {
                             type="checkbox"
                             checked={formData.members.includes(u._id)}
                             onChange={(e) => {
+                              console.log('checkbox - user object:', u);
+                              console.log('checkbox - user id:', u.id);
+                              console.log('checkbox - user _id:', u._id);
                               if (e.target.checked) {
                                 setFormData({
                                   ...formData,
