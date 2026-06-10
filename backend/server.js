@@ -3,7 +3,9 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
 
-dotenv.config();
+const envPath = path.resolve(__dirname, '.env');
+dotenv.config({ path: envPath });
+console.log('Loaded backend env from', envPath);
 
 const authRoutes = require('./routes/authRoutes');
 

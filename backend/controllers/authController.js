@@ -3,7 +3,7 @@ const { OAuth2Client } = require('google-auth-library');
 const { supabase } = require('../config/supabase');
 const { toCamelUser } = require('../services/formatters');
 
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const googleClient = new OAuth2Client((process.env.GOOGLE_CLIENT_ID || '').trim());
 
 const generateToken = (user) => {
   return jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, {
@@ -105,7 +105,7 @@ exports.googleLogin = async (req, res) => {
 
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID
+      audience: (process.env.GOOGLE_CLIENT_ID || '').trim()
     });
 
     const payload = ticket.getPayload();

@@ -43,6 +43,9 @@ export default function Login() {
   const hasGoogleClientId = Boolean(import.meta.env.VITE_GOOGLE_CLIENT_ID);
 
   useEffect(() => {
+    console.log('Login.jsx: VITE_GOOGLE_CLIENT_ID =', import.meta.env.VITE_GOOGLE_CLIENT_ID);
+    console.log('Login.jsx: VITE env keys =', Object.keys(import.meta.env).filter((key) => key.startsWith('VITE_')));
+
     let mounted = true;
 
     const init = async () => {
