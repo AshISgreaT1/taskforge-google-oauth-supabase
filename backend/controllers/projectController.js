@@ -164,18 +164,21 @@ exports.createProject = async (req, res) => {
     if (error) throw error;
 
     if (Array.isArray(members) && members.length > 0) {
-      const memberRows = members.map(member => ({
-        project_id: projectRow.id,
-        user_id: member.user || member.user_id || member,
-        role: PROJECT_ROLES.includes(member.role) ? member.role : 'member',
-        added_by: req.user.id
-      }));
+      const validMembers = members.filter(m => m && (m.user || m.user_id || m));
+      if (validMembers.length > 0) {
+        const memberRows = validMembers.map(member => ({
+          project_id: projectRow.id,
+          user_id: member.user || member.user_id || member,
+          role: PROJECT_ROLES.includes(member.role) ? member.role : 'member',
+          added_by: req.user.id
+        }));
 
-      const { error: memberError } = await supabase
-        .from('project_members')
-        .insert(memberRows);
+        const { error: memberError } = await supabase
+          .from('project_members')
+          .insert(memberRows);
 
-      if (memberError) throw memberError;
+        if (memberError) throw memberError;
+      }
     }
 
     const project = await hydrateProject(projectRow);
@@ -242,18 +245,21 @@ exports.updateProject = async (req, res) => {
       if (deleteError) throw deleteError;
 
       if (members.length > 0) {
-        const memberRows = members.map(member => ({
-          project_id: req.params.id,
-          user_id: member?.user || member?.user_id || member,
-          role: PROJECT_ROLES.includes(member?.role) ? member?.role : 'member',
-          added_by: req.user.id
-        }));
+        const validMembers = members.filter(m => m && (m.user || m.user_id || m));
+        if (validMembers.length > 0) {
+          const memberRows = validMembers.map(member => ({
+            project_id: req.params.id,
+            user_id: member?.user || member?.user_id || member,
+            role: PROJECT_ROLES.includes(member?.role) ? member?.role : 'member',
+            added_by: req.user.id
+          }));
 
-        const { error: memberError } = await supabase
-          .from('project_members')
-          .insert(memberRows);
+          const { error: memberError } = await supabase
+            .from('project_members')
+            .insert(memberRows);
 
-        if (memberError) throw memberError;
+          if (memberError) throw memberError;
+        }
       }
     }
 
