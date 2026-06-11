@@ -435,9 +435,11 @@ export default function ProjectDetail() {
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <label className="block text-sm font-medium mb-2">Assign To</label>
+                      {console.log('TASK USERS ARRAY:', users)}
                       <select
                         value={formData.assignedTo}
                         onChange={(e) => {
+                          console.log('SELECT VALUE:', e.target.value);
                           const selectedUser = users.find(u => u.id === e.target.value);
                           console.log('Selected assignee object:', selectedUser);
                           console.log('Selected assignee id:', selectedUser?.id);
